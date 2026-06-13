@@ -1,0 +1,8 @@
+.env
+.env.*
+.venv/
+__pycache__/
+*.pyc
+history.json
+CLAUDE.local.md
+server.log
