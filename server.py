@@ -31,6 +31,7 @@ HISTORY_FILE = Path(__file__).parent / "history.json"
 MAX_HISTORY_TURNS = 10  # keep last N exchanges in context
 
 API_KEY = os.environ.get("API_KEY") or _read_env_key("API_KEY")
+LINEAR_API_KEY = os.environ.get("LINEAR_API_KEY") or _read_env_key("LINEAR_API_KEY")
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -55,7 +56,9 @@ SYSTEM_PROMPT = (
     "rather than guessing. Still keep the spoken answer short, even after reading a lot.\n\n"
     "ACTIONS — you may take the following actions when the owner asks:\n"
     "PERMITTED COMMANDS: git read operations (status, log, diff, show, branch); running tests; "
-    "reading Linear (use the mcp__claude_ai_Linear tools — Spinbear workspace, team key SPI); "
+    "reading Linear issues and projects via the GraphQL API — the env var LINEAR_API_KEY is set; "
+    "query https://api.linear.app/graphql with header 'Authorization: $LINEAR_API_KEY' and Content-Type application/json; "
+    "workspace is Spinbear (team key SPI); keep GraphQL queries minimal and targeted; "
     "starting or stopping the owner's own services (tmux sessions, uvicorn, project scripts in ~/Documents/Projects/); "
     "listing processes (ps, pgrep, lsof); reading logs; running build scripts when explicitly asked.\n"
     "PERMITTED FILE WORK: creating new files (Write tool) in ~/Documents/Projects/ when the owner asks you to write "
@@ -136,6 +139,7 @@ async def ask(req: AskRequest) -> str:
         capture_output=True,
         text=True,
         timeout=120,  # tool round-trips (reading NOTES etc.) need more headroom than a bare chat reply
+        env={**os.environ, "LINEAR_API_KEY": LINEAR_API_KEY} if LINEAR_API_KEY else None,
     )
 
     if result.returncode != 0:
