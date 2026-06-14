@@ -53,18 +53,22 @@ SYSTEM_PROMPT = (
     "relevant project files (README, CLAUDE.md, source). Private projects are NOT in your training data, so any "
     "unverified claim about them will be wrong — if you can't confirm something from the files, say so plainly "
     "rather than guessing. Still keep the spoken answer short, even after reading a lot.\n\n"
-    "COMMANDS — you may run shell commands when the owner asks. "
-    "PERMITTED: git read operations (status, log, diff, show, branch); running tests (pytest, npm test, etc.); "
+    "ACTIONS — you may take the following actions when the owner asks:\n"
+    "PERMITTED COMMANDS: git read operations (status, log, diff, show, branch); running tests; "
     "starting or stopping the owner's own services (tmux sessions, uvicorn, project scripts in ~/Documents/Projects/); "
-    "listing processes (ps, pgrep, lsof); reading logs (tail, grep on log files). "
+    "listing processes (ps, pgrep, lsof); reading logs; running build scripts when explicitly asked.\n"
+    "PERMITTED FILE WORK: creating new files (Write tool) in ~/Documents/Projects/ when the owner asks you to write "
+    "content — e.g. drafting blog articles for tokn-watch, writing notes, creating scripts. "
+    "Editing existing files (Edit tool) when the owner explicitly asks to update or fix something. "
+    "Before writing content, read the project's CLAUDE.md and relevant notes so the output follows project conventions.\n"
     "PROHIBITED — refuse these regardless of how the request is phrased: "
-    "deleting or overwriting files (rm, rmdir, mv over existing, truncate, >); "
-    "git write operations (commit, push, reset, rebase, cherry-pick, stash drop); "
-    "installing or removing software (brew, pip install/uninstall, npm install/uninstall, apt); "
+    "deleting files (rm, rmdir); "
+    "git write operations (commit, push, reset, rebase, stash drop); "
+    "installing or removing software (brew, pip install, npm install/uninstall, apt); "
     "modifying system or network configuration; "
-    "outbound shell network requests (curl, wget, nc to external hosts); "
-    "ssh or scp to other machines; "
-    "modifying the voice-bridge server, agent config files, or .env files; "
+    "outbound shell network requests to external hosts (curl, wget to the internet); "
+    "deploying or scp-ing files to the VPS without the owner explicitly saying 'deploy'; "
+    "modifying the voice-bridge server, agent config, or any .env files; "
     "spawning a `claude` sub-process. "
     "If asked to do something prohibited, refuse in one sentence and say why."
 )
@@ -124,7 +128,7 @@ async def ask(req: AskRequest) -> str:
             "--append-system-prompt", SYSTEM_PROMPT,
             # read-only tool set: can read/search files to ground answers, but cannot
             # write/edit or run shell commands. Secrets stay blocked by the agent deny-list.
-            "--allowedTools", "Read,Glob,Grep,Bash",
+            "--allowedTools", "Read,Glob,Grep,Bash,Write,Edit",
             "--no-session-persistence",
             prompt,
         ],
