@@ -34,6 +34,7 @@ def _read_env_key(key: str, env_file: Optional[Path] = None) -> str:
     return ""
 
 HISTORY_FILE = Path(__file__).parent / "history.json"
+RESULTS_FILE = Path(__file__).parent / "results_queue.json"
 MAX_HISTORY_TURNS = 10  # keep last N exchanges in context
 
 # A normal spoken Q&A finishes fast. If the claude job hasn't returned within
@@ -46,9 +47,12 @@ HARD_CAP = 900          # 15 min absolute ceiling for a background job
 API_KEY = os.environ.get("API_KEY") or _read_env_key("API_KEY")
 LINEAR_API_KEY = os.environ.get("LINEAR_API_KEY") or _read_env_key("LINEAR_API_KEY")
 
-# Completion-notification channels (first configured one wins).
-# Pushcut: server POSTs to its API → a pre-configured notification on the iPhone
-# runs a Shortcut whose final action is "Speak Text". This is the (b) path.
+# Completion notification for the (b) "speak it" path.
+# Pushcut's *dynamic content* (per-call text/input) is a paid feature, so we don't
+# rely on it: the server rings a STATIC Pushcut notification (free tier) purely as
+# a doorbell, and the Shortcut it launches fetches the actual text from /result/next
+# here and speaks that. If Pushcut isn't configured, fall back to a Telegram push
+# carrying the full text (free, read-not-spoken).
 PUSHCUT_API_KEY = os.environ.get("PUSHCUT_API_KEY") or _read_env_key("PUSHCUT_API_KEY")
 PUSHCUT_NOTIFICATION = (
     os.environ.get("PUSHCUT_NOTIFICATION")
@@ -134,6 +138,37 @@ def trim_history(history: list[dict]) -> list[dict]:
     return history[-max_messages:] if len(history) > max_messages else history
 
 
+def load_results() -> list[str]:
+    if RESULTS_FILE.exists():
+        try:
+            return json.loads(RESULTS_FILE.read_text())
+        except Exception:
+            return []
+    return []
+
+
+def save_results(results: list[str]) -> None:
+    RESULTS_FILE.write_text(json.dumps(results, ensure_ascii=False, indent=2))
+
+
+def enqueue_result(text: str) -> None:
+    """Queue a finished job's spoken text for the Shortcut to fetch via /result/next.
+    Persisted so a restart between completion and the user's tap doesn't lose it."""
+    results = load_results()
+    results.append(text)
+    save_results(results)
+
+
+def pop_result() -> str:
+    """Return and remove the oldest queued result (empty string if none)."""
+    results = load_results()
+    if not results:
+        return ""
+    text = results.pop(0)
+    save_results(results)
+    return text
+
+
 def record_turn(user_text: str, reply: str) -> None:
     """Append a completed exchange to history (re-reads to avoid clobbering a
     concurrent write — backgrounded jobs finish out of band)."""
@@ -190,15 +225,19 @@ def _post_json(url: str, payload: dict, headers: dict) -> None:
 
 
 def _notify_sync(text: str) -> None:
-    """Push a completion message to the phone. Pushcut first (its notification
-    runs a Shortcut that speaks `text`); Telegram as a tap-to-read fallback."""
+    """Alert the phone that a finished result is waiting.
+
+    Pushcut path (free): ring the STATIC notification as a doorbell — it carries
+    no dynamic content (that's Pushcut's paid feature); the Shortcut it launches
+    pulls the words from /result/next. The result is queued by the caller before
+    this runs. Telegram fallback: send the full text to read."""
     if PUSHCUT_API_KEY:
         try:
+            # Bare trigger — no title/text/input. The notification's own static
+            # config shows the banner and runs the "speak the next result" Shortcut.
             _post_json(
                 f"https://api.pushcut.io/v1/notifications/{PUSHCUT_NOTIFICATION}",
-                # `text` is the visible notification body; `input` is what Pushcut
-                # passes to the Run-Shortcut action (the Shortcut speaks it).
-                {"title": "voice-bridge", "text": text, "input": text},
+                {},
                 {"API-Key": PUSHCUT_API_KEY},
             )
             return
@@ -233,17 +272,20 @@ def spawn_background(coro) -> None:
 
 
 async def finish_in_background(task: "asyncio.Task", user_text: str) -> None:
-    """Await a promoted job, record it, and push the result to the phone."""
+    """Await a promoted job, record it, queue the spoken text, and ring the phone."""
     try:
         rc, out, err = await task
     except Exception as exc:
-        await notify(f"Sorry — the background task errored: {exc}")
-        return
-    if rc != 0:
-        await notify(f"Sorry — the background task failed: {err[:200] or out[:200]}")
-        return
-    reply = out or "Done."
-    record_turn(user_text, reply)
+        reply = f"Sorry, the background task errored: {exc}"
+    else:
+        if rc != 0:
+            reply = f"Sorry, the background task failed: {err[:200] or out[:200]}"
+        else:
+            reply = out or "Done."
+            record_turn(user_text, reply)
+    # Queue the text first so it's available the instant the Shortcut fetches it,
+    # then ring the doorbell (Pushcut) / send the fallback (Telegram).
+    enqueue_result(reply)
     await notify(reply)
 
 
@@ -276,6 +318,14 @@ async def ask(req: AskRequest) -> str:
     # and return a short spoken ack now so the phone is freed.
     spawn_background(finish_in_background(task, user_text))
     return "Okay, I've started on that. I'll let you know on your phone when it's ready."
+
+
+@app.api_route("/result/next", methods=["GET", "POST"], response_class=PlainTextResponse,
+               dependencies=[Depends(_require_key)])
+async def result_next() -> str:
+    """Pop the oldest finished-job result for the Speak-Voice-Result Shortcut to
+    read aloud. Returns a spoken-friendly placeholder when nothing is queued."""
+    return pop_result() or "No new results."
 
 
 @app.delete("/history", response_class=PlainTextResponse, dependencies=[Depends(_require_key)])
