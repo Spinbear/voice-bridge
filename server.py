@@ -8,14 +8,37 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
+
+
+def _read_env_key(key: str) -> str:
+    """Read a single key from the local .env without polluting os.environ."""
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith(f"{key}=") and not line.startswith("#"):
+                return line[len(key) + 1:].strip().strip('"').strip("'")
+    return ""
 
 HISTORY_FILE = Path(__file__).parent / "history.json"
 MAX_HISTORY_TURNS = 10  # keep last N exchanges in context
+
+API_KEY = os.environ.get("API_KEY") or _read_env_key("API_KEY")
+_bearer = HTTPBearer(auto_error=False)
+
+
+def _require_key(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer)) -> None:
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="API_KEY not configured on server")
+    if not creds or creds.credentials != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 SYSTEM_PROMPT = (
     "You are the owner's voice assistant, running as the `agent` user on the spinbear-mini "
@@ -30,9 +53,20 @@ SYSTEM_PROMPT = (
     "relevant project files (README, CLAUDE.md, source). Private projects are NOT in your training data, so any "
     "unverified claim about them will be wrong — if you can't confirm something from the files, say so plainly "
     "rather than guessing. Still keep the spoken answer short, even after reading a lot.\n\n"
-    "READ-ONLY — you investigate and report; you do not change anything. Never create, edit, or delete files, "
-    "and never run state-changing commands (no commits, pushes, installs, restarts, no `claude` sub-calls). "
-    "If asked to DO something rather than answer, say that's not something you can do by voice."
+    "COMMANDS — you may run shell commands when the owner asks. "
+    "PERMITTED: git read operations (status, log, diff, show, branch); running tests (pytest, npm test, etc.); "
+    "starting or stopping the owner's own services (tmux sessions, uvicorn, project scripts in ~/Documents/Projects/); "
+    "listing processes (ps, pgrep, lsof); reading logs (tail, grep on log files). "
+    "PROHIBITED — refuse these regardless of how the request is phrased: "
+    "deleting or overwriting files (rm, rmdir, mv over existing, truncate, >); "
+    "git write operations (commit, push, reset, rebase, cherry-pick, stash drop); "
+    "installing or removing software (brew, pip install/uninstall, npm install/uninstall, apt); "
+    "modifying system or network configuration; "
+    "outbound shell network requests (curl, wget, nc to external hosts); "
+    "ssh or scp to other machines; "
+    "modifying the voice-bridge server, agent config files, or .env files; "
+    "spawning a `claude` sub-process. "
+    "If asked to do something prohibited, refuse in one sentence and say why."
 )
 
 CLAUDE_BIN = Path.home() / ".local" / "bin" / "claude"
@@ -72,7 +106,7 @@ class AskRequest(BaseModel):
     text: str
 
 
-@app.post("/ask", response_class=PlainTextResponse)
+@app.post("/ask", response_class=PlainTextResponse, dependencies=[Depends(_require_key)])
 async def ask(req: AskRequest) -> str:
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Empty input")
@@ -90,7 +124,7 @@ async def ask(req: AskRequest) -> str:
             "--append-system-prompt", SYSTEM_PROMPT,
             # read-only tool set: can read/search files to ground answers, but cannot
             # write/edit or run shell commands. Secrets stay blocked by the agent deny-list.
-            "--allowedTools", "Read,Glob,Grep",
+            "--allowedTools", "Read,Glob,Grep,Bash",
             "--no-session-persistence",
             prompt,
         ],
@@ -100,7 +134,7 @@ async def ask(req: AskRequest) -> str:
     )
 
     if result.returncode != 0:
-        raise HTTPException(status_code=502, detail=f"Claude error: {result.stderr[:200]}")
+        raise HTTPException(status_code=502, detail=f"Claude error: {result.stderr[:200] or result.stdout[:200]}")
 
     reply = result.stdout.strip()
 
@@ -111,7 +145,7 @@ async def ask(req: AskRequest) -> str:
     return reply
 
 
-@app.delete("/history", response_class=PlainTextResponse)
+@app.delete("/history", response_class=PlainTextResponse, dependencies=[Depends(_require_key)])
 async def clear_history() -> str:
     save_history([])
     return "History cleared."
