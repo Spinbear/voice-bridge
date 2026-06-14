@@ -55,6 +55,7 @@ SYSTEM_PROMPT = (
     "rather than guessing. Still keep the spoken answer short, even after reading a lot.\n\n"
     "ACTIONS — you may take the following actions when the owner asks:\n"
     "PERMITTED COMMANDS: git read operations (status, log, diff, show, branch); running tests; "
+    "reading Linear (use the mcp__claude_ai_Linear tools — Spinbear workspace, team key SPI); "
     "starting or stopping the owner's own services (tmux sessions, uvicorn, project scripts in ~/Documents/Projects/); "
     "listing processes (ps, pgrep, lsof); reading logs; running build scripts when explicitly asked.\n"
     "PERMITTED FILE WORK: creating new files (Write tool) in ~/Documents/Projects/ when the owner asks you to write "
@@ -128,7 +129,7 @@ async def ask(req: AskRequest) -> str:
             "--append-system-prompt", SYSTEM_PROMPT,
             # read-only tool set: can read/search files to ground answers, but cannot
             # write/edit or run shell commands. Secrets stay blocked by the agent deny-list.
-            "--allowedTools", "Read,Glob,Grep,Bash,Write,Edit",
+            "--allowedTools", "Read,Glob,Grep,Bash,Write,Edit,mcp__claude_ai_Linear,mcp__0b5df993-74ea-4b67-ab52-95bf2f19bfdd,ToolSearch",
             "--no-session-persistence",
             prompt,
         ],
