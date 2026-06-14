@@ -196,7 +196,9 @@ def _notify_sync(text: str) -> None:
         try:
             _post_json(
                 f"https://api.pushcut.io/v1/notifications/{PUSHCUT_NOTIFICATION}",
-                {"title": "voice-bridge", "text": text},
+                # `text` is the visible notification body; `input` is what Pushcut
+                # passes to the Run-Shortcut action (the Shortcut speaks it).
+                {"title": "voice-bridge", "text": text, "input": text},
                 {"API-Key": PUSHCUT_API_KEY},
             )
             return
