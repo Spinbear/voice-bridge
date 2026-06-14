@@ -289,6 +289,18 @@ async def finish_in_background(task: "asyncio.Task", user_text: str) -> None:
     await notify(reply)
 
 
+@app.on_event("startup")
+async def _renotify_queued() -> None:
+    """On restart, re-ring the phone for any results that were queued but whose
+    notification was lost (e.g. a restart killed the background task mid-notify)."""
+    pending = load_results()
+    if pending:
+        count = len(pending)
+        label = "result" if count == 1 else "results"
+        print(f"[voice-bridge] startup: {count} queued {label} — re-notifying", flush=True)
+        await notify(f"Voice bridge restarted with {count} pending {label} waiting. Tap to hear.")
+
+
 class AskRequest(BaseModel):
     text: str
 
