@@ -2,11 +2,17 @@
 voice-bridge: Tailscale-only FastAPI server.
 Receives spoken text from iOS Shortcut → Claude CLI → returns reply text.
 Uses the installed claude CLI (no API key needed — rides Claude Code subscription).
+
+Long tasks (e.g. "prepare the next tokn-watch article") auto-promote to a
+background job: the /ask request returns a short spoken ack within SOFT_DEADLINE
+seconds, the job keeps running detached, and when it finishes the result is
+pushed to the phone (Pushcut → a Shortcut speaks it; Telegram as fallback).
 """
 
+import asyncio
 import json
 import os
-import subprocess
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -17,9 +23,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 
-def _read_env_key(key: str) -> str:
-    """Read a single key from the local .env without polluting os.environ."""
-    env_file = Path(__file__).parent / ".env"
+def _read_env_key(key: str, env_file: Optional[Path] = None) -> str:
+    """Read a single key from a .env file without polluting os.environ."""
+    env_file = env_file or (Path(__file__).parent / ".env")
     if env_file.exists():
         for line in env_file.read_text().splitlines():
             line = line.strip()
@@ -30,8 +36,30 @@ def _read_env_key(key: str) -> str:
 HISTORY_FILE = Path(__file__).parent / "history.json"
 MAX_HISTORY_TURNS = 10  # keep last N exchanges in context
 
+# A normal spoken Q&A finishes fast. If the claude job hasn't returned within
+# SOFT_DEADLINE, we stop waiting on the HTTP request (so the phone is freed and
+# the iOS Shortcut doesn't itself time out) and let the job finish in the
+# background, notifying the phone on completion. HARD_CAP bounds a runaway job.
+SOFT_DEADLINE = 25      # seconds to wait before promoting to a background job
+HARD_CAP = 900          # 15 min absolute ceiling for a background job
+
 API_KEY = os.environ.get("API_KEY") or _read_env_key("API_KEY")
 LINEAR_API_KEY = os.environ.get("LINEAR_API_KEY") or _read_env_key("LINEAR_API_KEY")
+
+# Completion-notification channels (first configured one wins).
+# Pushcut: server POSTs to its API → a pre-configured notification on the iPhone
+# runs a Shortcut whose final action is "Speak Text". This is the (b) path.
+PUSHCUT_API_KEY = os.environ.get("PUSHCUT_API_KEY") or _read_env_key("PUSHCUT_API_KEY")
+PUSHCUT_NOTIFICATION = (
+    os.environ.get("PUSHCUT_NOTIFICATION")
+    or _read_env_key("PUSHCUT_NOTIFICATION")
+    or "voice-bridge-done"
+)
+# Telegram fallback: reaches the phone as a push you tap (read, not auto-spoken).
+_TG_ENV = Path.home() / ".claude" / "channels" / "telegram" / ".env"
+TELEGRAM_BOT_TOKEN = _read_env_key("TELEGRAM_BOT_TOKEN", _TG_ENV)
+OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID") or _read_env_key("OWNER_CHAT_ID") or "6917470053"
+
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -54,6 +82,11 @@ SYSTEM_PROMPT = (
     "relevant project files (README, CLAUDE.md, source). Private projects are NOT in your training data, so any "
     "unverified claim about them will be wrong — if you can't confirm something from the files, say so plainly "
     "rather than guessing. Still keep the spoken answer short, even after reading a lot.\n\n"
+    "TASK LENGTH — a long task (drafting an article, a multi-file change) is fine: just do it. "
+    "The server returns a short spoken acknowledgement to the owner immediately and delivers your final reply "
+    "to their phone when you finish, so you do NOT need to refuse long work or rush. When you finish a long task, "
+    "make your final reply a short spoken confirmation of what you did (e.g. 'The tokn-watch article is drafted "
+    "and saved, ready for review') — the file itself stays on disk; never read a long document aloud.\n\n"
     "ACTIONS — you may take the following actions when the owner asks:\n"
     "PERMITTED COMMANDS: git read operations (status, log, diff, show, branch); running tests; "
     "reading and updating Linear via the GraphQL API — the env var LINEAR_API_KEY is set; "
@@ -101,6 +134,15 @@ def trim_history(history: list[dict]) -> list[dict]:
     return history[-max_messages:] if len(history) > max_messages else history
 
 
+def record_turn(user_text: str, reply: str) -> None:
+    """Append a completed exchange to history (re-reads to avoid clobbering a
+    concurrent write — backgrounded jobs finish out of band)."""
+    history = load_history()
+    history.append({"role": "user", "content": user_text})
+    history.append({"role": "assistant", "content": reply})
+    save_history(trim_history(history))
+
+
 def build_prompt(history: list[dict], user_text: str) -> str:
     lines = []
     for msg in history:
@@ -109,6 +151,98 @@ def build_prompt(history: list[dict], user_text: str) -> str:
     lines.append(f"User: {user_text}")
     lines.append("Assistant:")
     return "\n".join(lines)
+
+
+def _claude_env() -> Optional[dict]:
+    return {**os.environ, "LINEAR_API_KEY": LINEAR_API_KEY} if LINEAR_API_KEY else None
+
+
+async def run_claude(prompt: str) -> tuple[int, str, str]:
+    """Run the claude CLI, returning (returncode, stdout, stderr). Bounded by
+    HARD_CAP so a stuck job can't run forever."""
+    proc = await asyncio.create_subprocess_exec(
+        str(CLAUDE_BIN),
+        "-p",
+        "--output-format", "text",
+        "--append-system-prompt", SYSTEM_PROMPT,
+        "--allowedTools",
+        "Read,Glob,Grep,Bash,Write,Edit,mcp__claude_ai_Linear,mcp__0b5df993-74ea-4b67-ab52-95bf2f19bfdd,ToolSearch",
+        "--no-session-persistence",
+        prompt,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=_claude_env(),
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=HARD_CAP)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        return -1, "", f"job exceeded HARD_CAP ({HARD_CAP}s)"
+    return proc.returncode, out.decode().strip(), err.decode().strip()
+
+
+def _post_json(url: str, payload: dict, headers: dict) -> None:
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", **headers})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
+
+
+def _notify_sync(text: str) -> None:
+    """Push a completion message to the phone. Pushcut first (its notification
+    runs a Shortcut that speaks `text`); Telegram as a tap-to-read fallback."""
+    if PUSHCUT_API_KEY:
+        try:
+            _post_json(
+                f"https://api.pushcut.io/v1/notifications/{PUSHCUT_NOTIFICATION}",
+                {"title": "voice-bridge", "text": text},
+                {"API-Key": PUSHCUT_API_KEY},
+            )
+            return
+        except Exception as exc:  # fall through to Telegram
+            print(f"[voice-bridge] Pushcut notify failed: {exc}", flush=True)
+    if TELEGRAM_BOT_TOKEN and OWNER_CHAT_ID:
+        try:
+            _post_json(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                {"chat_id": OWNER_CHAT_ID, "text": text},
+                {},
+            )
+            return
+        except Exception as exc:
+            print(f"[voice-bridge] Telegram notify failed: {exc}", flush=True)
+    print(f"[voice-bridge] no notify channel configured; result: {text}", flush=True)
+
+
+async def notify(text: str) -> None:
+    await asyncio.to_thread(_notify_sync, text)
+
+
+# Hold strong refs to detached jobs — the event loop only keeps weak refs, so an
+# un-referenced background task can be garbage-collected mid-run.
+_BG_TASKS: set = set()
+
+
+def spawn_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
+async def finish_in_background(task: "asyncio.Task", user_text: str) -> None:
+    """Await a promoted job, record it, and push the result to the phone."""
+    try:
+        rc, out, err = await task
+    except Exception as exc:
+        await notify(f"Sorry — the background task errored: {exc}")
+        return
+    if rc != 0:
+        await notify(f"Sorry — the background task failed: {err[:200] or out[:200]}")
+        return
+    reply = out or "Done."
+    record_turn(user_text, reply)
+    await notify(reply)
 
 
 class AskRequest(BaseModel):
@@ -120,39 +254,26 @@ async def ask(req: AskRequest) -> str:
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Empty input")
 
+    user_text = req.text.strip()
     history = load_history()
-    prompt = build_prompt(history, req.text.strip())
+    prompt = build_prompt(history, user_text)
 
-    result = subprocess.run(
-        [
-            str(CLAUDE_BIN),
-            "-p",
-            "--output-format", "text",
-            # append (not replace) the default agent prompt so it keeps its tool-using
-            # brain, then layer the voice style + grounding/read-only rules on top.
-            "--append-system-prompt", SYSTEM_PROMPT,
-            # read-only tool set: can read/search files to ground answers, but cannot
-            # write/edit or run shell commands. Secrets stay blocked by the agent deny-list.
-            "--allowedTools", "Read,Glob,Grep,Bash,Write,Edit,mcp__claude_ai_Linear,mcp__0b5df993-74ea-4b67-ab52-95bf2f19bfdd,ToolSearch",
-            "--no-session-persistence",
-            prompt,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,  # tool round-trips (reading NOTES etc.) need more headroom than a bare chat reply
-        env={**os.environ, "LINEAR_API_KEY": LINEAR_API_KEY} if LINEAR_API_KEY else None,
-    )
+    task = asyncio.create_task(run_claude(prompt))
+    done, _ = await asyncio.wait({task}, timeout=SOFT_DEADLINE)
 
-    if result.returncode != 0:
-        raise HTTPException(status_code=502, detail=f"Claude error: {result.stderr[:200] or result.stdout[:200]}")
+    if task in done:
+        # Fast path: finished within the soft deadline — answer synchronously,
+        # spoken aloud by the Shortcut exactly as before.
+        rc, out, err = task.result()
+        if rc != 0:
+            raise HTTPException(status_code=502, detail=f"Claude error: {err[:200] or out[:200]}")
+        record_turn(user_text, out)
+        return out
 
-    reply = result.stdout.strip()
-
-    history.append({"role": "user", "content": req.text.strip()})
-    history.append({"role": "assistant", "content": reply})
-    save_history(trim_history(history))
-
-    return reply
+    # Slow path: promote to a background job. Detach it, notify on completion,
+    # and return a short spoken ack now so the phone is freed.
+    spawn_background(finish_in_background(task, user_text))
+    return "Okay, I've started on that. I'll let you know on your phone when it's ready."
 
 
 @app.delete("/history", response_class=PlainTextResponse, dependencies=[Depends(_require_key)])
