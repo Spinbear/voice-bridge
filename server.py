@@ -47,6 +47,17 @@ MAX_HISTORY_TURNS = 10  # keep last N exchanges in context
 SOFT_DEADLINE = 25      # seconds to wait before promoting to a background job
 HARD_CAP = 900          # 15 min absolute ceiling for a background job
 
+# Spoken requests that *start with* one of these phrases are forced down the
+# delayed/background path no matter how fast the answer is — so the delayed
+# pipeline (ack now → doorbell + /result/next later) can be tested on demand.
+# The trigger phrase is stripped; whatever follows becomes the actual question.
+FORCE_BG_TRIGGERS = (
+    "test delay",
+    "delay test",
+    "delayed test",
+    "test the delayed answer",
+)
+
 API_KEY = os.environ.get("API_KEY") or _read_env_key("API_KEY")
 LINEAR_API_KEY = os.environ.get("LINEAR_API_KEY") or _read_env_key("LINEAR_API_KEY")
 
@@ -327,6 +338,20 @@ async def _renotify_queued() -> None:
         await notify(f"Voice bridge restarted with {count} pending {label} waiting. Tap to hear.")
 
 
+def strip_force_trigger(text: str) -> tuple[bool, str]:
+    """If `text` starts with a FORCE_BG_TRIGGERS phrase, return (True, the rest
+    of the request with the trigger removed); otherwise (False, text unchanged).
+    A bare trigger (nothing after it) gets a default self-test question."""
+    low = text.lstrip().lower()
+    for trig in FORCE_BG_TRIGGERS:
+        if low.startswith(trig):
+            remainder = text.lstrip()[len(trig):].lstrip(" ,.:;-—")
+            if not remainder:
+                remainder = "In one short spoken sentence, confirm that the delayed answer path is working."
+            return True, remainder
+    return False, text
+
+
 class AskRequest(BaseModel):
     text: str
 
@@ -336,11 +361,18 @@ async def ask(req: AskRequest) -> str:
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Empty input")
 
-    user_text = req.text.strip()
+    force_bg, user_text = strip_force_trigger(req.text.strip())
     history = load_history()
     prompt = build_prompt(history, user_text)
 
     task = asyncio.create_task(run_claude(prompt))
+
+    if force_bg:
+        # Forced delayed path: detach immediately without waiting the soft
+        # deadline, so the ack + doorbell + /result/next flow always exercises.
+        spawn_background(finish_in_background(task, user_text))
+        return "I'm checking. I will get back to you once done."
+
     done, _ = await asyncio.wait({task}, timeout=SOFT_DEADLINE)
 
     if task in done:

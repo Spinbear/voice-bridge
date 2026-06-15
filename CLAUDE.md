@@ -14,6 +14,10 @@ Tailscale-only FastAPI server that powers hands-free voice interaction with Clau
 - **Long tasks run as background jobs.** `/ask` waits `SOFT_DEADLINE` (25s); a normal Q&A returns
   synchronously and is spoken aloud. Anything slower (e.g. drafting an article) detaches, returns
   a short spoken ack, and on completion queues its text and rings the phone (`HARD_CAP` 15m).
+  A request that **starts with** a `FORCE_BG_TRIGGERS` phrase ("test delay", "delay test",
+  "delayed test", "test the delayed answer") is forced down the delayed path regardless of speed —
+  the trigger is stripped and the rest becomes the question — so the delayed pipeline can be
+  tested on demand. `/result/next` is FIFO, so drain stale results (hear "No new results.") first.
 - **Completion → phone speaks (free path).** Pushcut's dynamic notification content is paid, so
   the server rings a **static** Pushcut notification as a doorbell and queues the reply; the
   Shortcut it launches fetches the words from `/result/next` and speaks them. Tapping the
