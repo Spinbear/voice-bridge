@@ -45,7 +45,7 @@ Recovery + machine kit: see `mac-mini-ops` RUNBOOK §5b/§5e. Re-run after each 
 
 ## Endpoints
 - `POST /ask` — `{"text": "..."}` → plain text reply (Bearer-auth'd; long tasks return an ack + run in background)
-- `GET|POST /result/next` — pop the oldest queued background-job result (Bearer-auth'd; used by the Speak-Voice-Result Shortcut)
+- `GET|POST /result/next` (alias `/results/next`) — pop the oldest queued background-job result (Bearer-auth'd; used by the Speak-Voice-Result Shortcut, which was built with the plural path)
 - `DELETE /history` — wipe conversation history (Bearer-auth'd)
 - `GET /health` — liveness check (open)
 

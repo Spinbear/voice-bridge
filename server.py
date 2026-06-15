@@ -394,9 +394,12 @@ async def ask(req: AskRequest) -> str:
 
 @app.api_route("/result/next", methods=["GET", "POST"], response_class=PlainTextResponse,
                dependencies=[Depends(_require_key)])
+@app.api_route("/results/next", methods=["GET", "POST"], response_class=PlainTextResponse,
+               dependencies=[Depends(_require_key)])
 async def result_next() -> str:
     """Pop the oldest finished-job result for the Speak-Voice-Result Shortcut to
-    read aloud. Returns a spoken-friendly placeholder when nothing is queued."""
+    read aloud. Returns a spoken-friendly placeholder when nothing is queued.
+    `/results/next` (plural) is an alias — the Shortcut was built with that path."""
     return pop_result() or "No new results."
 
 
