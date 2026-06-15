@@ -329,7 +329,7 @@ async def ask(req: AskRequest) -> str:
     # Slow path: promote to a background job. Detach it, notify on completion,
     # and return a short spoken ack now so the phone is freed.
     spawn_background(finish_in_background(task, user_text))
-    return "Okay, I've started on that. I'll let you know on your phone when it's ready."
+    return "I'm checking. I will get back to you once done."
 
 
 @app.api_route("/result/next", methods=["GET", "POST"], response_class=PlainTextResponse,
