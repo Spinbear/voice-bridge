@@ -21,6 +21,11 @@ Tailscale-only FastAPI server that powers hands-free voice interaction with Clau
   fallback channel (full text to read) when `PUSHCUT_API_KEY` is unset.
 - `history.json` — rolling conversation history (auto-managed, gitignored)
 - `results_queue.json` — pending finished-job results awaiting a `/result/next` fetch (gitignored)
+- `activity.jsonl` — **append-only, never-trimmed** durable log of every completed `/ask`
+  (Berlin timestamp, mode, request, reply); gitignored. Solves "the voice agent did X but
+  there's no record" — `history.json` is only a rolling 10-turn window. For *what the agent
+  did* (not just in/out), the system prompt also tells it to append a dated entry to the
+  worked-on project's NOTES.md after any state-changing task.
 - `.env` — `TAILSCALE_IP`, `PORT`, `API_KEY`, `LINEAR_API_KEY`, `PUSHCUT_API_KEY`
   (`PUSHCUT_NOTIFICATION` optional, defaults `voice-bridge-done`); plus a **vestigial**
   `ANTHROPIC_API_KEY` left from the first SDK-based draft — unused; the CLI path needs no key

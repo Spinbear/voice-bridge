@@ -5,5 +5,6 @@ __pycache__/
 *.pyc
 history.json
 results_queue.json
+activity.jsonl
 CLAUDE.local.md
 server.log

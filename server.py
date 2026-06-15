@@ -13,8 +13,10 @@ import asyncio
 import json
 import os
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException
@@ -35,6 +37,7 @@ def _read_env_key(key: str, env_file: Optional[Path] = None) -> str:
 
 HISTORY_FILE = Path(__file__).parent / "history.json"
 RESULTS_FILE = Path(__file__).parent / "results_queue.json"
+ACTIVITY_FILE = Path(__file__).parent / "activity.jsonl"
 MAX_HISTORY_TURNS = 10  # keep last N exchanges in context
 
 # A normal spoken Q&A finishes fast. If the claude job hasn't returned within
@@ -91,6 +94,14 @@ SYSTEM_PROMPT = (
     "to their phone when you finish, so you do NOT need to refuse long work or rush. When you finish a long task, "
     "make your final reply a short spoken confirmation of what you did (e.g. 'The tokn-watch article is drafted "
     "and saved, ready for review') — the file itself stays on disk; never read a long document aloud.\n\n"
+    "RECORD-KEEPING — after you complete any task that creates, changes, or publishes content, or otherwise "
+    "changes state (writing/editing files, drafting or publishing an article, updating Linear, running a "
+    "state-changing command), append a brief dated entry to the worked-on project's NOTES.md so there is a "
+    "durable record — the same way an interactive session logs its work. Convention: newest entry LAST (append "
+    "at the END of the file, never mid-file); a dated header using today's Europe/Berlin date (run `date` if "
+    "unsure), then 1-3 lines covering what you did, where, and any file paths. Do this as part of finishing the "
+    "task, without being asked; it is separate from (and in addition to) your short spoken reply. A read-only "
+    "question needs no entry.\n\n"
     "ACTIONS — you may take the following actions when the owner asks:\n"
     "PERMITTED COMMANDS: git read operations (status, log, diff, show, branch); running tests; "
     "reading and updating Linear via the GraphQL API — the env var LINEAR_API_KEY is set; "
@@ -176,6 +187,20 @@ def record_turn(user_text: str, reply: str) -> None:
     history.append({"role": "user", "content": user_text})
     history.append({"role": "assistant", "content": reply})
     save_history(trim_history(history))
+
+
+def log_activity(request: str, reply: str, mode: str) -> None:
+    """Append-only durable record of every completed voice task — NEVER trimmed
+    (unlike history.json's rolling window). One JSON object per line: Berlin
+    timestamp, mode (sync/background/sync-error), the request, and the spoken
+    reply. Best-effort: a logging failure must not break the response."""
+    try:
+        ts = datetime.now(ZoneInfo("Europe/Berlin")).isoformat(timespec="seconds")
+        entry = {"ts": ts, "mode": mode, "request": request, "reply": reply}
+        with ACTIVITY_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"[voice-bridge] activity log failed: {exc}", flush=True)
 
 
 def build_prompt(history: list[dict], user_text: str) -> str:
@@ -286,6 +311,7 @@ async def finish_in_background(task: "asyncio.Task", user_text: str) -> None:
     # Queue the text first so it's available the instant the Shortcut fetches it,
     # then ring the doorbell (Pushcut) / send the fallback (Telegram).
     enqueue_result(reply)
+    log_activity(user_text, reply, "background")
     await notify(reply)
 
 
@@ -322,8 +348,10 @@ async def ask(req: AskRequest) -> str:
         # spoken aloud by the Shortcut exactly as before.
         rc, out, err = task.result()
         if rc != 0:
+            log_activity(user_text, f"[error] {err[:200] or out[:200]}", "sync-error")
             raise HTTPException(status_code=502, detail=f"Claude error: {err[:200] or out[:200]}")
         record_turn(user_text, out)
+        log_activity(user_text, out, "sync")
         return out
 
     # Slow path: promote to a background job. Detach it, notify on completion,
