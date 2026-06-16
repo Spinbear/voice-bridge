@@ -8,8 +8,9 @@ Tailscale-only FastAPI server that powers hands-free voice interaction with Clau
   The CLI runs **project-aware** via `--append-system-prompt` (keeps its tool-using brain, plus
   the voice style + grounding rules) with `--allowedTools Read,Glob,Grep,Bash,Write,Edit,...` —
   it can read files to ground answers and, when the owner asks, run permitted commands and
-  author content (e.g. tokn-watch drafts). The system prompt enforces a permit/prohibit list
-  (no deletes, no git writes, no installs, no deploy without "deploy"); secrets stay blocked by
+  author content (e.g. tokn-watch drafts), email the owner via the `~/bin/agent-mail.py` policy wrapper (owner
+  inboxes only — work/personal/kindle), and send docs to the owner's Kindle (kindle skill). The system prompt enforces a permit/prohibit list
+  (no deletes, no git writes, no installs, no deploy without "deploy", no email to anyone but the owner); secrets stay blocked by
   the agent deny-list. `/ask` is **Bearer-auth'd** (`API_KEY` in `.env`).
 - **Long tasks run as background jobs.** `/ask` waits `SOFT_DEADLINE` (25s); a normal Q&A returns
   synchronously and is spoken aloud. Anything slower (e.g. drafting an article) detaches, returns

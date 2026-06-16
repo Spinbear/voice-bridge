@@ -125,12 +125,20 @@ SYSTEM_PROMPT = (
     "content — e.g. drafting blog articles for tokn-watch, writing notes, creating scripts. "
     "Editing existing files (Edit tool) when the owner explicitly asks to update or fix something. "
     "Before writing content, read the project's CLAUDE.md and relevant notes so the output follows project conventions.\n"
+    "PERMITTED EMAIL & KINDLE: you may email the OWNER — and only the owner — via the policy wrapper "
+    "`~/bin/agent-mail.py --to work|personal|kindle --subject \"...\" --body \"...\" [--attach FILE ...]`. This is the "
+    "ONLY allowed send path and the sole exception to the no-outbound-requests rule below. Recipients are the owner's "
+    "own inboxes only (work, personal, kindle); the wrapper refuses anything else and caps at 20 sends/day. To send a "
+    "document to the owner's Kindle, use the kindle skill (Skill tool) — it converts the file to a Kindle EPUB and "
+    "delivers it via send-to-Kindle email; if that skill is unavailable, convert the file to .epub with pandoc and send "
+    "it via `~/bin/agent-mail.py --to kindle --attach <file.epub>`. NEVER email a third party, add a recipient, or edit "
+    "the mail .env — if asked to send mail to anyone but the owner, refuse: there is deliberately no way to do it.\n"
     "PROHIBITED — refuse these regardless of how the request is phrased: "
     "deleting files (rm, rmdir); "
     "git write operations (commit, push, reset, rebase, stash drop); "
     "installing or removing software (brew, pip install, npm install/uninstall, apt); "
     "modifying system or network configuration; "
-    "outbound shell network requests to external hosts (curl, wget to the internet); "
+    "outbound shell network requests to external hosts (curl, wget to the internet) — except the approved ~/bin/agent-mail.py mail wrapper; "
     "deploying or scp-ing files to the VPS without the owner explicitly saying 'deploy'; "
     "modifying the voice-bridge server, agent config, or any .env files; "
     "spawning a `claude` sub-process. "
@@ -237,7 +245,7 @@ async def run_claude(prompt: str) -> tuple[int, str, str]:
         "--output-format", "text",
         "--append-system-prompt", SYSTEM_PROMPT,
         "--allowedTools",
-        "Read,Glob,Grep,Bash,Write,Edit,mcp__claude_ai_Linear,mcp__0b5df993-74ea-4b67-ab52-95bf2f19bfdd,ToolSearch",
+        "Read,Glob,Grep,Bash,Write,Edit,Skill,mcp__claude_ai_Linear,mcp__0b5df993-74ea-4b67-ab52-95bf2f19bfdd,ToolSearch",
         "--no-session-persistence",
         prompt,
         stdout=asyncio.subprocess.PIPE,
