@@ -53,3 +53,6 @@ iOS Shortcut built and working end-to-end. Apple Watch availability TBD (see Tel
 - Done: Confirmed final `Agent Reply` shortcut = **Get Contents `/results/next` → Speak `Contents of URL`** (Stop-and-Output removed; it broke Watch playback). No server/code changes this stretch — reference Q&A only.
 - Reference (Siri triggering, so it isn't re-asked): the **Siri phrase IS the shortcut's name** — rename the shortcut to change it (rename syncs to Watch now that iCloud is healthy). The **"Hey Siri" wake word is NOT customizable** — Apple only offers "Siri" or "Hey Siri" (Settings → Apple Intelligence & Siri → "Listen for"); no custom wake word possible. On the **Watch**, skip the wake word via **Raise to Speak** or **hold the Digital Crown**. If `Agent Reply` is ever renamed, **re-point the Pushcut `voice-bridge-done` action** to the new name (Pushcut matches by exact name).
 - Next: unchanged — Mac-mini `say` auto-speak investigation; real voice test of tokn-watch article #12.
+
+## 2026-06-16
+Wrote `HOW-IT-WORKS.md` — a shareable one-page doc explaining the full voice pipeline (user experience, step-by-step flow, components needed, agent permissions, endpoints, and how to run the server) pitched at a technical reader unfamiliar with this setup.
