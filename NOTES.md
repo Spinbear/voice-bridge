@@ -56,3 +56,8 @@ iOS Shortcut built and working end-to-end. Apple Watch availability TBD (see Tel
 
 ## 2026-06-16
 Wrote `HOW-IT-WORKS.md` — a shareable one-page doc explaining the full voice pipeline (user experience, step-by-step flow, components needed, agent permissions, endpoints, and how to run the server) pitched at a technical reader unfamiliar with this setup.
+
+## 2026-06-16 (session 2)
+- Done: Reviewed `HOW-IT-WORKS.md` and fixed an inaccuracy — the example request showed `https://` but the server runs plain **`http://`** (Tailscale provides the encryption; there is no TLS on the port). Committed + pushed.
+- Reference (TTS voice on the Watch, so it isn't re-debugged): the **Speak Text action's voice is independent of BOTH the Siri voice and the VoiceOver voice** — changing those does nothing to the agent. The Watch was speaking **American male** because "Voice 3" is a **Siri voice**, and the Watch's Speak Text can only use **named system voices**, not the Siri "Voice 1–5" set. Fix = in the Speak Text action set **Language = English (United Kingdom)** and **Voice = a named British female** (Kate / Serena / Martha), downloaded on the Watch. The phone honors Siri/premium voices; the Watch's smaller catalog falls back to a default (US male) when the chosen voice isn't a named voice present on it.
+- Next: Confirm the named British female voice (e.g. **Kate**) actually plays on the Watch — if even that falls back, the Watch lacks any en-GB female for Speak Text and the honest fallback is **Samantha** (US female, guaranteed on the Watch). Still open from prior sessions: Mac-mini `say` auto-speak investigation; a real voice test of writing tokn-watch article #12.

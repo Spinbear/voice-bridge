@@ -22,7 +22,7 @@ Voice → iOS Shortcut → voice-bridge server → Claude agent → spoken reply
 An iOS Shortcut uses Apple's built-in **Dictate Text** action (synchronous — hands back the transcript inline). It then POSTs the transcript to the server:
 
 ```
-POST https://<tailscale-ip>:8765/ask
+POST http://<tailscale-ip>:8765/ask
 Authorization: Bearer <API_KEY>
 {"text": "your question here"}
 ```
