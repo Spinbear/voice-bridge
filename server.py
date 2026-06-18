@@ -379,7 +379,7 @@ async def ask(req: AskRequest) -> str:
         # Forced delayed path: detach immediately without waiting the soft
         # deadline, so the ack + doorbell + /result/next flow always exercises.
         spawn_background(finish_in_background(task, user_text))
-        return "I'm checking. I will get back to you once done."
+        return "I'm on it."
 
     done, _ = await asyncio.wait({task}, timeout=SOFT_DEADLINE)
 
@@ -397,7 +397,7 @@ async def ask(req: AskRequest) -> str:
     # Slow path: promote to a background job. Detach it, notify on completion,
     # and return a short spoken ack now so the phone is freed.
     spawn_background(finish_in_background(task, user_text))
-    return "I'm checking. I will get back to you once done."
+    return "I'm on it."
 
 
 @app.api_route("/result/next", methods=["GET", "POST"], response_class=PlainTextResponse,

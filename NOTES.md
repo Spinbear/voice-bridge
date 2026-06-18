@@ -79,3 +79,19 @@ Wrote `HOW-IT-WORKS.md` — a shareable one-page doc explaining the full voice p
 
 ## 2026-06-16 (session — email transport fixed; full record in mac-mini-ops)
 - The voice agent's email broke on first use (Google blocks basic-auth SMTP for the agent Gmail: `534 WebLoginRequired`). Fixed by migrating the **shared** `agent-mail.py` wrapper from SMTP to the **Gmail API (OAuth)** — test send OK, the agent can email + Kindle again. This is **cross-project infra** (the mail wrapper serves every agent session + the Telegram bot), so the full record lives in **`mac-mini-ops` RUNBOOK §5f + NOTES (2026-06-16)**, not here. No voice-bridge code changed by this — the voice-bridge-specific part (granting the agent the email/Kindle *authority* in its system prompt) is the entry above.
+
+## 2026-06-17
+- Done: Decided to build a native iPhone + Apple Watch app (voice-bridge-ios) to replace the iOS Shortcuts front-end. Scaffolded the new project at `~/Documents/Projects/dev/voice-bridge-ios/` with ARCHITECTURE.md covering Swift/SwiftUI stack, WatchConnectivity flow, Keychain auth, and a four-phase build plan.
+- Decided: Server stays untouched; app is a pure Swift front-end over Tailscale. Phase 1 = iPhone only; Phase 2 adds Watch via WatchConnectivity; Phase 3 targets native on-Watch speech recognition.
+- Next: Review ARCHITECTURE.md and create the Xcode project.
+
+## 2026-06-18 (long-task ack wording)
+- Done: Changed the long-task spoken acknowledgement in `server.py` from "I'm checking. I will get back to you once done." to "I'm on it." — applies to both the force-background path and the slow-path fallback (lines 382 and 400). Server restart required to pick up the change.
+
+## 2026-06-18 (Linear board consolidation)
+- Done: Created a new "tokn-watch" project in the Spinbear Linear team and moved all 150 issues from the six P1–P6 phase projects into it. Team now has two clean projects: tokn-watch (150 issues, all phases) and GoSancho. P1–P6 projects are now empty shells and can be archived/deleted manually in Linear.
+
+## 2026-06-18 (session 3 — Linear archiving + GoSancho board completion)
+- Done: Archived oldest 20 completed BCK/SPI tickets (BCK-10–BCK-34 + SPI-158–SPI-165) → created SPI-236 as a reference ticket preserving all content. Then archived 30 completed tokn-watch tickets → created SPI-237 as a second reference ticket. Using the freed slots, created SPI-238–SPI-249 (12 issues) completing the GoSancho board Sessions 9 and 10 (settings polish, IAP unlock, open-source prep, and release checklist).
+- Decided: Archive in batches with a single reference ticket per batch so content is never lost — the reference ticket pattern will be reused for future housekeeping rounds.
+- Next: Archive P1–P6 empty shell projects in Linear (can now be done manually). Continue with GoSancho development.
