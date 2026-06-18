@@ -79,6 +79,23 @@ _TG_ENV = Path.home() / ".claude" / "channels" / "telegram" / ".env"
 TELEGRAM_BOT_TOKEN = _read_env_key("TELEGRAM_BOT_TOKEN", _TG_ENV)
 OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID") or _read_env_key("OWNER_CHAT_ID") or "6917470053"
 
+# APNs (token-based push) — silently wakes the GoSancho app to fetch /v1/results.
+# Entirely optional: if the key/creds or the apns module are missing, APNs is
+# disabled and delivery falls back to the Pushcut/Telegram doorbell exactly as before.
+APNS_KEY_PATH = os.environ.get("APNS_KEY_PATH") or _read_env_key("APNS_KEY_PATH")
+APNS_KEY_ID = os.environ.get("APNS_KEY_ID") or _read_env_key("APNS_KEY_ID")
+APNS_TEAM_ID = os.environ.get("APNS_TEAM_ID") or _read_env_key("APNS_TEAM_ID")
+APNS_TOPIC = os.environ.get("APNS_TOPIC") or _read_env_key("APNS_TOPIC")
+DEVICES_FILE = Path(__file__).parent / "devices.json"
+try:
+    import apns as _apns
+    _APNS_OK = True
+except Exception as _exc:  # missing deps must never take the server down
+    _apns, _APNS_OK = None, False
+    print(f"[voice-bridge] APNs disabled (import failed: {_exc})", flush=True)
+APNS_ENABLED = bool(_APNS_OK and APNS_KEY_PATH and APNS_KEY_ID and APNS_TEAM_ID
+                    and APNS_TOPIC and Path(APNS_KEY_PATH).exists())
+
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -242,6 +259,63 @@ def legacy_pending_count() -> int:
     return sum(1 for r in store["results"] if r["id"] > store["legacy_cursor"])
 
 
+# --- APNs device registry + silent-wake fan-out ------------------------------
+
+def _load_devices() -> list[dict]:
+    if DEVICES_FILE.exists():
+        try:
+            return json.loads(DEVICES_FILE.read_text())
+        except Exception:
+            return []
+    return []
+
+
+def _save_devices(devices: list[dict]) -> None:
+    DEVICES_FILE.write_text(json.dumps(devices, ensure_ascii=False, indent=2))
+
+
+def register_device(token: str, env: str) -> None:
+    """Upsert an APNs device token (env = 'sandbox' | 'production'), capped."""
+    devices = [d for d in _load_devices() if d.get("token") != token]
+    devices.append({"token": token, "env": env})
+    _save_devices(devices[-20:])
+
+
+def push_to_devices(task_id: Optional[str]) -> bool:
+    """Silent wake push to every registered device so the app fetches /v1/results.
+    The result text is NOT in the payload — it never leaves your server (privacy);
+    the push is just a doorbell carrying the task id. Returns True if at least one
+    device accepted. Prunes dead tokens (BadDeviceToken / Unregistered / 410)."""
+    if not APNS_ENABLED:
+        return False
+    devices = _load_devices()
+    if not devices:
+        return False
+    payload = {"aps": {"content-available": 1}, "task_id": task_id}
+    delivered, survivors = False, []
+    for d in devices:
+        try:
+            status, reason = _apns.send_push(
+                d["token"], key_path=APNS_KEY_PATH, key_id=APNS_KEY_ID,
+                team_id=APNS_TEAM_ID, topic=APNS_TOPIC,
+                sandbox=(d.get("env") != "production"), payload=payload)
+        except Exception as exc:
+            print(f"[voice-bridge] APNs send error: {exc}", flush=True)
+            survivors.append(d)  # keep on transient error
+            continue
+        if status == 200:
+            delivered = True
+            survivors.append(d)
+        elif reason in ("BadDeviceToken", "Unregistered") or status == 410:
+            print(f"[voice-bridge] pruning dead device token ({reason})", flush=True)
+        else:
+            print(f"[voice-bridge] APNs {status} {reason}", flush=True)
+            survivors.append(d)
+    if len(survivors) != len(devices):
+        _save_devices(survivors)
+    return delivered
+
+
 def record_turn(user_text: str, reply: str) -> None:
     """Append a completed exchange to history (re-reads to avoid clobbering a
     concurrent write — backgrounded jobs finish out of band)."""
@@ -375,7 +449,13 @@ async def finish_in_background(task: "asyncio.Task", user_text: str,
     # then ring the doorbell (Pushcut) / send the fallback (Telegram).
     enqueue_result(reply, task_id)
     log_activity(user_text, reply, "background")
-    await notify(reply)
+    # Client-aware delivery: if a registered device got the silent APNs wake (the
+    # app fetches the text from /v1/results itself), skip the legacy Pushcut/Telegram
+    # doorbell — that's what stops the now-redundant empty Shortcut trigger. Fall
+    # back to the doorbell when APNs is off or no device accepted.
+    pushed = await asyncio.to_thread(push_to_devices, task_id)
+    if not pushed:
+        await notify(reply)
 
 
 @app.on_event("startup")
@@ -466,6 +546,22 @@ async def v1_results(after: int = 0, limit: int = RESULTS_RETAIN) -> dict:
     `legacy_cursor`, so it never starves the Shortcut and the Shortcut never
     starves it — the two consumers are independent."""
     return results_after(after, limit)
+
+
+class DeviceRegistration(BaseModel):
+    token: str
+    env: str = "sandbox"
+
+
+@app.post("/v1/devices", dependencies=[Depends(_require_key)])
+async def v1_register_device(reg: DeviceRegistration) -> dict:
+    """Register this device's APNs token so long-task results wake the app to
+    fetch them. `env` is 'sandbox' (dev/TestFlight-internal) or 'production'."""
+    token = reg.token.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Empty token")
+    register_device(token, "production" if reg.env == "production" else "sandbox")
+    return {"ok": True, "apns_enabled": APNS_ENABLED}
 
 
 @app.delete("/history", response_class=PlainTextResponse, dependencies=[Depends(_require_key)])
