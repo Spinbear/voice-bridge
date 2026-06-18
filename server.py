@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import urllib.request
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -168,35 +169,77 @@ def trim_history(history: list[dict]) -> list[dict]:
     return history[-max_messages:] if len(history) > max_messages else history
 
 
-def load_results() -> list[str]:
-    if RESULTS_FILE.exists():
-        try:
-            return json.loads(RESULTS_FILE.read_text())
-        except Exception:
-            return []
-    return []
+RESULTS_RETAIN = 50  # keep at most the last N results in the log
 
 
-def save_results(results: list[str]) -> None:
-    RESULTS_FILE.write_text(json.dumps(results, ensure_ascii=False, indent=2))
+def _load_store() -> dict:
+    """Load the result store as the v2 object, migrating the old list-of-strings
+    shape on read. Shape: {version, seq, legacy_cursor, results:[{id, task_id,
+    text, created_at}]}. `legacy_cursor` = the highest id already handed to the
+    destructive /result*/next consumer (the legacy iOS Shortcut)."""
+    empty = {"version": 2, "seq": 0, "legacy_cursor": 0, "results": []}
+    if not RESULTS_FILE.exists():
+        return empty
+    try:
+        raw = json.loads(RESULTS_FILE.read_text())
+    except Exception:
+        return empty
+    if isinstance(raw, dict) and raw.get("version") == 2:
+        return raw
+    if isinstance(raw, list):  # migrate old format: bare strings, none popped yet
+        results = [{"id": i + 1, "task_id": None, "text": t, "created_at": None}
+                   for i, t in enumerate(raw)]
+        return {"version": 2, "seq": len(results), "legacy_cursor": 0, "results": results}
+    return empty
 
 
-def enqueue_result(text: str) -> None:
-    """Queue a finished job's spoken text for the Shortcut to fetch via /result/next.
-    Persisted so a restart between completion and the user's tap doesn't lose it."""
-    results = load_results()
-    results.append(text)
-    save_results(results)
+def _save_store(store: dict) -> None:
+    RESULTS_FILE.write_text(json.dumps(store, ensure_ascii=False, indent=2))
+
+
+def enqueue_result(text: str, task_id: Optional[str] = None) -> int:
+    """Append a finished job's spoken text to the append-only result log; return
+    its id. New clients read it non-destructively via /v1/results; the legacy
+    /result*/next endpoints consume it through `legacy_cursor`."""
+    store = _load_store()
+    store["seq"] += 1
+    entry = {"id": store["seq"], "task_id": task_id, "text": text,
+             "created_at": datetime.now().isoformat()}
+    store["results"].append(entry)
+    if len(store["results"]) > RESULTS_RETAIN:  # bound, but never drop legacy-unread
+        unread = {r["id"] for r in store["results"] if r["id"] > store["legacy_cursor"]}
+        recent = {r["id"] for r in store["results"][-RESULTS_RETAIN:]}
+        keep = unread | recent
+        store["results"] = [r for r in store["results"] if r["id"] in keep]
+    _save_store(store)
+    return entry["id"]
 
 
 def pop_result() -> str:
-    """Return and remove the oldest queued result (empty string if none)."""
-    results = load_results()
-    if not results:
+    """Legacy destructive read: return the oldest result the legacy consumer has
+    not yet seen and advance `legacy_cursor`; empty string if none. Behaviour is
+    identical to the original pop-queue (oldest-first, once each) for the Shortcut."""
+    store = _load_store()
+    nxt = next((r for r in store["results"] if r["id"] > store["legacy_cursor"]), None)
+    if nxt is None:
         return ""
-    text = results.pop(0)
-    save_results(results)
-    return text
+    store["legacy_cursor"] = nxt["id"]
+    _save_store(store)
+    return nxt["text"]
+
+
+def results_after(after_id: int, limit: int = RESULTS_RETAIN) -> dict:
+    """Non-destructive cursor read for new clients (GoSancho): results with
+    id > after_id (ascending), plus the latest seq for cursor sync."""
+    store = _load_store()
+    items = [r for r in store["results"] if r["id"] > after_id][:limit]
+    return {"results": items, "seq": store["seq"]}
+
+
+def legacy_pending_count() -> int:
+    """Count results the legacy consumer hasn't read (for startup re-notify)."""
+    store = _load_store()
+    return sum(1 for r in store["results"] if r["id"] > store["legacy_cursor"])
 
 
 def record_turn(user_text: str, reply: str) -> None:
@@ -315,7 +358,8 @@ def spawn_background(coro) -> None:
     task.add_done_callback(_BG_TASKS.discard)
 
 
-async def finish_in_background(task: "asyncio.Task", user_text: str) -> None:
+async def finish_in_background(task: "asyncio.Task", user_text: str,
+                               task_id: Optional[str] = None) -> None:
     """Await a promoted job, record it, queue the spoken text, and ring the phone."""
     try:
         rc, out, err = await task
@@ -327,9 +371,9 @@ async def finish_in_background(task: "asyncio.Task", user_text: str) -> None:
         else:
             reply = out or "Done."
             record_turn(user_text, reply)
-    # Queue the text first so it's available the instant the Shortcut fetches it,
+    # Queue the text first so it's available the instant a client fetches it,
     # then ring the doorbell (Pushcut) / send the fallback (Telegram).
-    enqueue_result(reply)
+    enqueue_result(reply, task_id)
     log_activity(user_text, reply, "background")
     await notify(reply)
 
@@ -338,9 +382,8 @@ async def finish_in_background(task: "asyncio.Task", user_text: str) -> None:
 async def _renotify_queued() -> None:
     """On restart, re-ring the phone for any results that were queued but whose
     notification was lost (e.g. a restart killed the background task mid-notify)."""
-    pending = load_results()
-    if pending:
-        count = len(pending)
+    count = legacy_pending_count()
+    if count:
         label = "result" if count == 1 else "results"
         print(f"[voice-bridge] startup: {count} queued {label} — re-notifying", flush=True)
         await notify(f"Voice bridge restarted with {count} pending {label} waiting. Tap to hear.")
@@ -365,10 +408,15 @@ class AskRequest(BaseModel):
 
 
 @app.post("/ask", response_class=PlainTextResponse, dependencies=[Depends(_require_key)])
-async def ask(req: AskRequest) -> str:
+async def ask(req: AskRequest):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Empty input")
 
+    # Mint a task id up front and return it as a header. The body stays plain
+    # text (legacy clients ignore the header); new clients use it to correlate
+    # the eventual /v1/results entry to this request.
+    task_id = "t_" + uuid.uuid4().hex[:12]
+    headers = {"X-Agent-Task-Id": task_id}
     force_bg, user_text = strip_force_trigger(req.text.strip())
     history = load_history()
     prompt = build_prompt(history, user_text)
@@ -378,8 +426,8 @@ async def ask(req: AskRequest) -> str:
     if force_bg:
         # Forced delayed path: detach immediately without waiting the soft
         # deadline, so the ack + doorbell + /result/next flow always exercises.
-        spawn_background(finish_in_background(task, user_text))
-        return "I'm on it."
+        spawn_background(finish_in_background(task, user_text, task_id))
+        return PlainTextResponse("I'm on it.", headers=headers)
 
     done, _ = await asyncio.wait({task}, timeout=SOFT_DEADLINE)
 
@@ -392,12 +440,12 @@ async def ask(req: AskRequest) -> str:
             raise HTTPException(status_code=502, detail=f"Claude error: {err[:200] or out[:200]}")
         record_turn(user_text, out)
         log_activity(user_text, out, "sync")
-        return out
+        return PlainTextResponse(out, headers=headers)
 
     # Slow path: promote to a background job. Detach it, notify on completion,
     # and return a short spoken ack now so the phone is freed.
-    spawn_background(finish_in_background(task, user_text))
-    return "I'm on it."
+    spawn_background(finish_in_background(task, user_text, task_id))
+    return PlainTextResponse("I'm on it.", headers=headers)
 
 
 @app.api_route("/result/next", methods=["GET", "POST"], response_class=PlainTextResponse,
@@ -409,6 +457,15 @@ async def result_next() -> str:
     read aloud. Returns a spoken-friendly placeholder when nothing is queued.
     `/results/next` (plural) is an alias — the Shortcut was built with that path."""
     return pop_result() or "No new results."
+
+
+@app.get("/v1/results", dependencies=[Depends(_require_key)])
+async def v1_results(after: int = 0, limit: int = RESULTS_RETAIN) -> dict:
+    """Non-destructive, id-correlated cursor read for new clients (GoSancho):
+    results with id > `after` (ascending) plus the latest `seq`. Does not touch
+    `legacy_cursor`, so it never starves the Shortcut and the Shortcut never
+    starves it — the two consumers are independent."""
+    return results_after(after, limit)
 
 
 @app.delete("/history", response_class=PlainTextResponse, dependencies=[Depends(_require_key)])
