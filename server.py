@@ -635,26 +635,26 @@ async def v1_register_device(reg: DeviceRegistration) -> dict:
 
 
 @app.get("/v1/projects", dependencies=[Depends(_require_key)])
-async def v1_projects() -> dict:
-    """List the folders the agent can be scoped to — directories at depth 1-2 under
-    PROJECTS_ROOT — so the client populates its picker instead of the user typing
-    paths. Bounded to PROJECTS_ROOT; never exposes the wider filesystem (SPI-254)."""
+async def v1_projects(path: Optional[str] = None) -> dict:
+    """List the immediate subfolders of `path` (default: PROJECTS_ROOT) so the
+    client can browse the tree one level at a time (nested picker, SPI-254).
+    `hasChildren` flags folders worth drilling into. Bounded to PROJECTS_ROOT —
+    an out-of-bounds path falls back to the root, never the wider filesystem."""
     root = PROJECTS_ROOT.resolve()
-    items: list[dict] = []
-    if root.is_dir():
-        for top in sorted(root.iterdir()):
-            if not top.is_dir() or top.name.startswith("."):
+    base = resolve_project(path) or root   # resolve_project bounds to root; None → root
+    entries: list[dict] = []
+    if base.is_dir():
+        for c in sorted(base.iterdir()):
+            if not c.is_dir() or c.name.startswith("."):
                 continue
-            items.append({"name": top.name, "path": str(top)})
             try:
-                for sub in sorted(top.iterdir()):
-                    if sub.is_dir() and not sub.name.startswith("."):
-                        items.append({"name": f"{top.name}/{sub.name}", "path": str(sub)})
-            except PermissionError:
-                pass
-            if len(items) >= 500:
+                has_children = any(s.is_dir() and not s.name.startswith(".") for s in c.iterdir())
+            except (PermissionError, OSError):
+                has_children = False
+            entries.append({"name": c.name, "path": str(c), "hasChildren": has_children})
+            if len(entries) >= 500:
                 break
-    return {"projects": items, "root": str(root)}
+    return {"path": str(base), "entries": entries}
 
 
 @app.delete("/history", response_class=PlainTextResponse, dependencies=[Depends(_require_key)])
