@@ -634,6 +634,29 @@ async def v1_register_device(reg: DeviceRegistration) -> dict:
     return {"ok": True, "apns_enabled": APNS_ENABLED}
 
 
+@app.get("/v1/projects", dependencies=[Depends(_require_key)])
+async def v1_projects() -> dict:
+    """List the folders the agent can be scoped to — directories at depth 1-2 under
+    PROJECTS_ROOT — so the client populates its picker instead of the user typing
+    paths. Bounded to PROJECTS_ROOT; never exposes the wider filesystem (SPI-254)."""
+    root = PROJECTS_ROOT.resolve()
+    items: list[dict] = []
+    if root.is_dir():
+        for top in sorted(root.iterdir()):
+            if not top.is_dir() or top.name.startswith("."):
+                continue
+            items.append({"name": top.name, "path": str(top)})
+            try:
+                for sub in sorted(top.iterdir()):
+                    if sub.is_dir() and not sub.name.startswith("."):
+                        items.append({"name": f"{top.name}/{sub.name}", "path": str(sub)})
+            except PermissionError:
+                pass
+            if len(items) >= 500:
+                break
+    return {"projects": items, "root": str(root)}
+
+
 @app.delete("/history", response_class=PlainTextResponse, dependencies=[Depends(_require_key)])
 async def clear_history() -> str:
     save_history([])
