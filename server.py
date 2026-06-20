@@ -36,10 +36,23 @@ def _read_env_key(key: str, env_file: Optional[Path] = None) -> str:
                 return line[len(key) + 1:].strip().strip('"').strip("'")
     return ""
 
-HISTORY_FILE = Path(__file__).parent / "history.json"
+HISTORY_FILE = Path(__file__).parent / "history.json"   # default (no-project) history
+HISTORY_DIR = Path(__file__).parent / "history"          # per-project history files (SPI-255)
 RESULTS_FILE = Path(__file__).parent / "results_queue.json"
 ACTIVITY_FILE = Path(__file__).parent / "activity.jsonl"
 MAX_HISTORY_TURNS = 10  # keep last N exchanges in context
+
+# Project scoping (SPI-255). A client may send a `project` path; the agent then
+# runs with that folder as its cwd (so the CLI auto-loads the project's CLAUDE.md
+# and file tools default there) and keeps a per-project conversation history. The
+# path is constrained to PROJECTS_ROOT so a typo/hostile value can't escape it.
+PROJECTS_ROOT = Path(
+    os.environ.get("PROJECTS_ROOT") or _read_env_key("PROJECTS_ROOT")
+    or str(Path.home() / "Documents" / "Projects")
+).expanduser()
+# Context files we surface to the agent if present (CLAUDE.md is auto-loaded by the
+# CLI via cwd; the rest are named so the agent reads whatever the project provides).
+CONTEXT_FILES = ("CLAUDE.md", "AGENTS.md", "README.md", "README", ".cursorrules")
 
 # A normal spoken Q&A finishes fast. If the claude job hasn't returned within
 # SOFT_DEADLINE, we stop waiting on the HTTP request (so the phone is freed and
@@ -176,17 +189,47 @@ CLAUDE_BIN = Path.home() / ".local" / "bin" / "claude"
 app = FastAPI(title="voice-bridge")
 
 
-def load_history() -> list[dict]:
-    if HISTORY_FILE.exists():
+def resolve_project(project: Optional[str]) -> Optional[Path]:
+    """Resolve a client-supplied project path to a safe directory under
+    PROJECTS_ROOT. Returns None (→ the agent runs in its default cwd) when absent
+    or out of bounds, so a typo or hostile path can never aim the agent outside
+    the projects root."""
+    if not project or not project.strip():
+        return None
+    try:
+        p = Path(project).expanduser().resolve()
+        root = PROJECTS_ROOT.resolve()
+    except Exception:
+        return None
+    if (p == root or root in p.parents) and p.is_dir():
+        return p
+    return None
+
+
+def _history_path(project: Optional[Path]) -> Path:
+    """One history file per project (namespaced by a hash of the path); the global
+    HISTORY_FILE when no project is selected."""
+    if project is None:
+        return HISTORY_FILE
+    import hashlib
+    key = hashlib.sha1(str(project).encode("utf-8")).hexdigest()[:16]
+    return HISTORY_DIR / f"{key}.json"
+
+
+def load_history(project: Optional[Path] = None) -> list[dict]:
+    path = _history_path(project)
+    if path.exists():
         try:
-            return json.loads(HISTORY_FILE.read_text())
+            return json.loads(path.read_text())
         except Exception:
             return []
     return []
 
 
-def save_history(history: list[dict]) -> None:
-    HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2))
+def save_history(history: list[dict], project: Optional[Path] = None) -> None:
+    path = _history_path(project)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(history, ensure_ascii=False, indent=2))
 
 
 def trim_history(history: list[dict]) -> list[dict]:
@@ -324,13 +367,13 @@ def push_to_devices(task_id: Optional[str]) -> bool:
     return delivered
 
 
-def record_turn(user_text: str, reply: str) -> None:
-    """Append a completed exchange to history (re-reads to avoid clobbering a
-    concurrent write — backgrounded jobs finish out of band)."""
-    history = load_history()
+def record_turn(user_text: str, reply: str, project: Optional[Path] = None) -> None:
+    """Append a completed exchange to the project's history (re-reads to avoid
+    clobbering a concurrent write — backgrounded jobs finish out of band)."""
+    history = load_history(project)
     history.append({"role": "user", "content": user_text})
     history.append({"role": "assistant", "content": reply})
-    save_history(trim_history(history))
+    save_history(trim_history(history), project)
 
 
 def log_activity(request: str, reply: str, mode: str) -> None:
@@ -347,23 +390,38 @@ def log_activity(request: str, reply: str, mode: str) -> None:
         print(f"[voice-bridge] activity log failed: {exc}", flush=True)
 
 
-def build_prompt(history: list[dict], user_text: str) -> str:
+def _context_hint(project: Optional[Path]) -> str:
+    """Native context discovery: tell the agent which project it's in and which of
+    the project's own context files exist (CLAUDE.md is auto-loaded by the CLI via
+    cwd; AGENTS.md/README/etc. are named so the agent reads whatever's there — it
+    works for any user's folder, including an empty one)."""
+    if project is None:
+        return ""
+    found = [f for f in CONTEXT_FILES if (project / f).is_file()]
+    note = f"You are working in the project at {project}."
+    if found:
+        note += " Read these for its conventions before acting: " + ", ".join(found) + "."
+    return note + "\n\n"
+
+
+def build_prompt(history: list[dict], user_text: str, project: Optional[Path] = None) -> str:
     lines = []
     for msg in history:
         role = "User" if msg["role"] == "user" else "Assistant"
         lines.append(f"{role}: {msg['content']}")
     lines.append(f"User: {user_text}")
     lines.append("Assistant:")
-    return "\n".join(lines)
+    return _context_hint(project) + "\n".join(lines)
 
 
 def _claude_env() -> Optional[dict]:
     return {**os.environ, "LINEAR_API_KEY": LINEAR_API_KEY} if LINEAR_API_KEY else None
 
 
-async def run_claude(prompt: str) -> tuple[int, str, str]:
+async def run_claude(prompt: str, cwd: Optional[Path] = None) -> tuple[int, str, str]:
     """Run the claude CLI, returning (returncode, stdout, stderr). Bounded by
-    HARD_CAP so a stuck job can't run forever."""
+    HARD_CAP so a stuck job can't run forever. When `cwd` is a project dir the CLI
+    runs inside it — its CLAUDE.md auto-loads and file tools default there (SPI-255)."""
     proc = await asyncio.create_subprocess_exec(
         str(CLAUDE_BIN),
         "-p",
@@ -376,6 +434,7 @@ async def run_claude(prompt: str) -> tuple[int, str, str]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=_claude_env(),
+        cwd=str(cwd) if cwd else None,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=HARD_CAP)
@@ -441,7 +500,8 @@ def spawn_background(coro) -> None:
 
 
 async def finish_in_background(task: "asyncio.Task", user_text: str,
-                               task_id: Optional[str] = None) -> None:
+                               task_id: Optional[str] = None,
+                               project: Optional[Path] = None) -> None:
     """Await a promoted job, record it, queue the spoken text, and ring the phone."""
     try:
         rc, out, err = await task
@@ -452,7 +512,7 @@ async def finish_in_background(task: "asyncio.Task", user_text: str,
             reply = f"Sorry, the background task failed: {err[:200] or out[:200]}"
         else:
             reply = out or "Done."
-            record_turn(user_text, reply)
+            record_turn(user_text, reply, project)
     # Queue the text first so it's available the instant a client fetches it,
     # then ring the doorbell (Pushcut) / send the fallback (Telegram).
     enqueue_result(reply, task_id)
@@ -493,6 +553,7 @@ def strip_force_trigger(text: str) -> tuple[bool, str]:
 
 class AskRequest(BaseModel):
     text: str
+    project: Optional[str] = None   # SPI-255: scope the agent to this folder
 
 
 @app.post("/ask", response_class=PlainTextResponse, dependencies=[Depends(_require_key)])
@@ -505,16 +566,17 @@ async def ask(req: AskRequest):
     # the eventual /v1/results entry to this request.
     task_id = "t_" + uuid.uuid4().hex[:12]
     headers = {"X-Agent-Task-Id": task_id}
+    project = resolve_project(req.project)   # None unless a valid in-bounds folder
     force_bg, user_text = strip_force_trigger(req.text.strip())
-    history = load_history()
-    prompt = build_prompt(history, user_text)
+    history = load_history(project)
+    prompt = build_prompt(history, user_text, project)
 
-    task = asyncio.create_task(run_claude(prompt))
+    task = asyncio.create_task(run_claude(prompt, cwd=project))
 
     if force_bg:
         # Forced delayed path: detach immediately without waiting the soft
         # deadline, so the ack + doorbell + /result/next flow always exercises.
-        spawn_background(finish_in_background(task, user_text, task_id))
+        spawn_background(finish_in_background(task, user_text, task_id, project))
         return PlainTextResponse("I'm on it.", headers=headers)
 
     done, _ = await asyncio.wait({task}, timeout=SOFT_DEADLINE)
@@ -526,13 +588,13 @@ async def ask(req: AskRequest):
         if rc != 0:
             log_activity(user_text, f"[error] {err[:200] or out[:200]}", "sync-error")
             raise HTTPException(status_code=502, detail=f"Claude error: {err[:200] or out[:200]}")
-        record_turn(user_text, out)
+        record_turn(user_text, out, project)
         log_activity(user_text, out, "sync")
         return PlainTextResponse(out, headers=headers)
 
     # Slow path: promote to a background job. Detach it, notify on completion,
     # and return a short spoken ack now so the phone is freed.
-    spawn_background(finish_in_background(task, user_text, task_id))
+    spawn_background(finish_in_background(task, user_text, task_id, project))
     return PlainTextResponse("I'm on it.", headers=headers)
 
 
