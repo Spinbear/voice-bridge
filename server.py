@@ -418,31 +418,101 @@ def _claude_env() -> Optional[dict]:
     return {**os.environ, "LINEAR_API_KEY": LINEAR_API_KEY} if LINEAR_API_KEY else None
 
 
-async def run_claude(prompt: str, cwd: Optional[Path] = None) -> tuple[int, str, str]:
-    """Run the claude CLI, returning (returncode, stdout, stderr). Bounded by
-    HARD_CAP so a stuck job can't run forever. When `cwd` is a project dir the CLI
-    runs inside it — its CLAUDE.md auto-loads and file tools default there (SPI-255)."""
+# --- Live agent-activity echo (tool-echo) --------------------------------------
+# As the claude CLI runs, each tool it uses is turned into a human one-liner and
+# appended to a per-task list, so the app can show "what the agent is doing" live
+# while a task runs. In-memory, bounded; the final spoken reply still flows through
+# the normal result path.
+_ACTIVITY: dict = {}
+_ACTIVITY_ORDER: list = []
+ACTIVITY_MAX_TASKS = 50
+
+
+def _append_activity(task_id: Optional[str], line: str) -> None:
+    if not task_id or not line:
+        return
+    if task_id not in _ACTIVITY:
+        _ACTIVITY[task_id] = []
+        _ACTIVITY_ORDER.append(task_id)
+        while len(_ACTIVITY_ORDER) > ACTIVITY_MAX_TASKS:
+            _ACTIVITY.pop(_ACTIVITY_ORDER.pop(0), None)
+    _ACTIVITY[task_id].append(line)
+
+
+def _tool_line(name: str, inp: dict) -> str:
+    """One human-readable line for a tool_use event."""
+    if name == "Bash":
+        return inp.get("description") or ("$ " + str(inp.get("command", ""))[:80])
+    if name in ("Read", "Edit", "Write", "NotebookEdit"):
+        verb = {"Read": "Reading", "Edit": "Editing", "Write": "Writing", "NotebookEdit": "Editing"}[name]
+        fp = str(inp.get("file_path", ""))
+        return f"{verb} {os.path.basename(fp) or fp}".strip()
+    if name in ("Glob", "Grep"):
+        return f"Searching {inp.get('pattern', '')}".strip()
+    if name == "Skill":
+        return f"Skill: {inp.get('command') or inp.get('name', '')}".strip()
+    if name == "Task":
+        return f"Subagent: {inp.get('description', 'working')}"
+    if "__" in name:
+        return name.split("__")[-1]
+    return name
+
+
+async def run_claude(prompt: str, cwd: Optional[Path] = None,
+                     task_id: Optional[str] = None) -> tuple[int, str, str]:
+    """Run the claude CLI with streaming JSON output, capturing each tool the agent
+    uses into the live per-task activity echo and returning the final spoken reply.
+    Bounded by HARD_CAP. `cwd` scopes the run to a project (SPI-255). The prompt is
+    fed via stdin (avoids the variadic --allowedTools swallowing it)."""
     proc = await asyncio.create_subprocess_exec(
         str(CLAUDE_BIN),
         "-p",
-        "--output-format", "text",
+        "--output-format", "stream-json", "--verbose",
         "--append-system-prompt", SYSTEM_PROMPT,
         "--allowedTools",
         "Read,Glob,Grep,Bash,Write,Edit,Skill,mcp__claude_ai_Linear,mcp__0b5df993-74ea-4b67-ab52-95bf2f19bfdd,ToolSearch",
         "--no-session-persistence",
-        prompt,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=_claude_env(),
         cwd=str(cwd) if cwd else None,
     )
+    if proc.stdin is not None:
+        proc.stdin.write(prompt.encode())
+        await proc.stdin.drain()
+        proc.stdin.close()
+
+    final = ""
+
+    async def _read() -> None:
+        nonlocal final
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace").strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except Exception:
+                continue
+            etype = evt.get("type")
+            if etype == "assistant":
+                for block in evt.get("message", {}).get("content", []):
+                    if block.get("type") == "tool_use":
+                        _append_activity(task_id, _tool_line(block.get("name", ""), block.get("input", {}) or {}))
+            elif etype == "result":
+                final = evt.get("result", "") or final
+
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=HARD_CAP)
+        await asyncio.wait_for(_read(), timeout=HARD_CAP)
     except asyncio.TimeoutError:
         proc.kill()
-        await proc.communicate()
+        await proc.wait()
         return -1, "", f"job exceeded HARD_CAP ({HARD_CAP}s)"
-    return proc.returncode, out.decode().strip(), err.decode().strip()
+    err = (await proc.stderr.read()).decode(errors="replace").strip() if proc.stderr else ""
+    rc = await proc.wait()
+    return rc, final.strip(), err
 
 
 def _post_json(url: str, payload: dict, headers: dict) -> None:
@@ -571,7 +641,7 @@ async def ask(req: AskRequest):
     history = load_history(project)
     prompt = build_prompt(history, user_text, project)
 
-    task = asyncio.create_task(run_claude(prompt, cwd=project))
+    task = asyncio.create_task(run_claude(prompt, cwd=project, task_id=task_id))
 
     if force_bg:
         # Forced delayed path: detach immediately without waiting the soft
@@ -655,6 +725,15 @@ async def v1_projects(path: Optional[str] = None) -> dict:
             if len(entries) >= 500:
                 break
     return {"path": str(base), "entries": entries}
+
+
+@app.get("/v1/activity", dependencies=[Depends(_require_key)])
+async def v1_activity(task_id: str, after: int = 0) -> dict:
+    """Live agent tool-activity echo for a (possibly still-running) task — the lines
+    the app shows under 'On it…'. `after` = how many the client already has; only
+    newer lines are returned so it can append."""
+    lines = _ACTIVITY.get(task_id, [])
+    return {"task_id": task_id, "lines": lines[after:], "total": len(lines)}
 
 
 @app.delete("/history", response_class=PlainTextResponse, dependencies=[Depends(_require_key)])
