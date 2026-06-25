@@ -60,6 +60,11 @@ CONTEXT_FILES = ("CLAUDE.md", "AGENTS.md", "README.md", "README", ".cursorrules"
 # background, notifying the phone on completion. HARD_CAP bounds a runaway job.
 SOFT_DEADLINE = 25      # seconds to wait before promoting to a background job
 HARD_CAP = 900          # 15 min absolute ceiling for a background job
+# Per-line buffer for the claude CLI's stream-json stdout. The asyncio default is
+# 64 KiB, which a single event line (a big tool result / file read) easily exceeds —
+# the overflow raised "Separator is found, but chunk is longer than limit" and errored
+# the whole task. 16 MiB gives generous headroom for large tool output.
+STREAM_LIMIT = 1024 * 1024 * 16
 
 # Spoken requests that *start with* one of these phrases are forced down the
 # delayed/background path no matter how fast the answer is — so the delayed
@@ -475,6 +480,7 @@ async def run_claude(prompt: str, cwd: Optional[Path] = None,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=STREAM_LIMIT,   # raise the per-line cap above the 64 KiB default
         env=_claude_env(),
         cwd=str(cwd) if cwd else None,
     )
@@ -510,6 +516,12 @@ async def run_claude(prompt: str, cwd: Optional[Path] = None,
         proc.kill()
         await proc.wait()
         return -1, "", f"job exceeded HARD_CAP ({HARD_CAP}s)"
+    except Exception as e:
+        # A stream-read failure (e.g. a line past STREAM_LIMIT) must not crash the task
+        # into a 500 - return it as a clean error the caller can surface / queue.
+        proc.kill()
+        await proc.wait()
+        return -1, "", f"stream read failed: {type(e).__name__}: {e}"
     err = (await proc.stderr.read()).decode(errors="replace").strip() if proc.stderr else ""
     rc = await proc.wait()
     return rc, final.strip(), err
