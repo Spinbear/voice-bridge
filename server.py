@@ -338,23 +338,32 @@ def register_device(token: str, env: str) -> None:
 
 
 def push_to_devices(task_id: Optional[str]) -> bool:
-    """Silent wake push to every registered device so the app fetches /v1/results.
-    The result text is NOT in the payload — it never leaves your server (privacy);
-    the push is just a doorbell carrying the task id. Returns True if at least one
+    """Visible 'doorbell' alert to every registered device when a long task finishes.
+    The body is GENERIC — the result text is NOT in the payload, so it never leaves
+    your server (privacy); the app fetches /v1/results itself when the user taps (the
+    task id rides along). A visible alert (vs a silent content-available wake) is the
+    reliable path: iOS heavily throttles silent pushes. Returns True if at least one
     device accepted. Prunes dead tokens (BadDeviceToken / Unregistered / 410)."""
     if not APNS_ENABLED:
         return False
     devices = _load_devices()
     if not devices:
         return False
-    payload = {"aps": {"content-available": 1}, "task_id": task_id}
+    payload = {
+        "aps": {
+            "alert": {"title": "Your task is done", "body": "Tap to read the result."},
+            "sound": "default",
+        },
+        "task_id": task_id,   # doorbell only — no result text in the payload
+    }
     delivered, survivors = False, []
     for d in devices:
         try:
             status, reason = _apns.send_push(
                 d["token"], key_path=APNS_KEY_PATH, key_id=APNS_KEY_ID,
                 team_id=APNS_TEAM_ID, topic=APNS_TOPIC,
-                sandbox=(d.get("env") != "production"), payload=payload)
+                sandbox=(d.get("env") != "production"), payload=payload,
+                push_type="alert")
         except Exception as exc:
             print(f"[voice-bridge] APNs send error: {exc}", flush=True)
             survivors.append(d)  # keep on transient error
