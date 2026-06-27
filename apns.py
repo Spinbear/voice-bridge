@@ -27,9 +27,10 @@ def _provider_jwt(key_path: str, key_id: str, team_id: str) -> str:
 
 def send_push(device_token: str, *, key_path: str, key_id: str, team_id: str,
               topic: str, sandbox: bool, payload: dict | None = None,
-              push_type: str = "background") -> tuple[int, str]:
+              push_type: str = "alert") -> tuple[int, str]:
     """POST a push to one device token. Returns (status, reason). 200 == accepted.
-    `background` = silent wake (content-available); `alert` = visible."""
+    `alert` = visible (the default — what we send); `background` = silent wake
+    (content-available), available but unused: iOS throttles silent pushes too hard."""
     host = "api.sandbox.push.apple.com" if sandbox else "api.push.apple.com"
     headers = {
         "authorization": f"bearer {_provider_jwt(key_path, key_id, team_id)}",
@@ -37,7 +38,9 @@ def send_push(device_token: str, *, key_path: str, key_id: str, team_id: str,
         "apns-push-type": push_type,
         "apns-priority": "5" if push_type == "background" else "10",
     }
-    body = payload or {"aps": {"content-available": 1}}
+    # Default body matches the default push_type (visible). Silent callers pass an
+    # explicit content-available payload + push_type="background".
+    body = payload or {"aps": {"alert": "Notification"}}
     with httpx.Client(http2=True, timeout=10) as client:
         r = client.post(f"https://{host}/3/device/{device_token}", headers=headers, json=body)
     if r.status_code == 200:
