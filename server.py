@@ -114,6 +114,27 @@ except Exception as _exc:  # missing deps must never take the server down
 APNS_ENABLED = bool(_APNS_OK and APNS_KEY_PATH and APNS_KEY_ID and APNS_TEAM_ID
                     and APNS_TOPIC and Path(APNS_KEY_PATH).exists())
 
+# --- Confirm gate (CONFIRM_GATE.md) — OPT-IN, default OFF -------------------
+# When enabled, run_claude wires a PreToolUse hook that pauses MUTATING tools
+# (Write/Edit/mutating Bash) until the owner approves on the phone, with a hard
+# timeout → DENY. Read-only tools never interrupt. Off ⇒ the hook is never
+# wired and the live assistant behaves exactly as before. The client confirm UI
+# (GoSancho screen 09) reads /v1/approvals and posts the decision.
+CONFIRM_GATE_ENABLED = (os.environ.get("CONFIRM_GATE_ENABLED")
+                        or _read_env_key("CONFIRM_GATE_ENABLED") or "").strip().lower() \
+                       in ("1", "true", "yes", "on")
+APPROVALS_FILE = Path(__file__).parent / "approvals.json"
+APPROVALS_RETAIN = 100
+CONFIRM_GATE_HOOK = Path(__file__).parent / "hooks" / "confirm_gate.py"
+CONFIRM_GATE_SETTINGS = Path(__file__).parent / "confirm_gate_settings.json"
+if CONFIRM_GATE_ENABLED:
+    # Generate the CLI --settings file with the absolute hook path (machine-local).
+    CONFIRM_GATE_SETTINGS.write_text(json.dumps({"hooks": {"PreToolUse": [{
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+        "hooks": [{"type": "command",
+                   "command": f"/usr/bin/python3 {CONFIRM_GATE_HOOK}"}]}]}}, indent=2))
+    print("[voice-bridge] confirm gate ENABLED (mutating tools require approval)", flush=True)
+
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -315,6 +336,60 @@ def legacy_pending_count() -> int:
     return sum(1 for r in store["results"] if r["id"] > store["legacy_cursor"])
 
 
+# --- Confirm-gate approval store ---------------------------------------------
+# Single-writer (this server) JSON store; the PreToolUse hook only POSTs new
+# requests and GETs state, the app POSTs decisions — so all writes serialize
+# here and there is no file-lock race.
+
+def _load_approvals() -> dict:
+    empty = {"version": 1, "seq": 0, "approvals": []}
+    if not APPROVALS_FILE.exists():
+        return empty
+    try:
+        raw = json.loads(APPROVALS_FILE.read_text())
+        return raw if isinstance(raw, dict) and raw.get("version") == 1 else empty
+    except Exception:
+        return empty
+
+
+def _save_approvals(store: dict) -> None:
+    APPROVALS_FILE.write_text(json.dumps(store, ensure_ascii=False, indent=2))
+
+
+def create_approval(tool: str, command: str, description: str,
+                    task_id: Optional[str]) -> dict:
+    store = _load_approvals()
+    store["seq"] += 1
+    entry = {"id": store["seq"], "task_id": task_id, "tool": tool,
+             "command": command, "description": description or tool,
+             "state": "pending", "created_at": datetime.now().isoformat(),
+             "decided_at": None}
+    store["approvals"].append(entry)
+    store["approvals"] = store["approvals"][-APPROVALS_RETAIN:]
+    _save_approvals(store)
+    return entry
+
+
+def get_approval(aid: int) -> Optional[dict]:
+    return next((a for a in _load_approvals()["approvals"] if a["id"] == aid), None)
+
+
+def decide_approval(aid: int, decision: str) -> Optional[dict]:
+    store = _load_approvals()
+    a = next((x for x in store["approvals"] if x["id"] == aid), None)
+    if a is None:
+        return None
+    if a["state"] == "pending":   # first decision wins; ignore late/duplicate posts
+        a["state"] = decision
+        a["decided_at"] = datetime.now().isoformat()
+        _save_approvals(store)
+    return a
+
+
+def pending_approvals() -> list[dict]:
+    return [a for a in _load_approvals()["approvals"] if a["state"] == "pending"]
+
+
 # --- APNs device registry + silent-wake fan-out ------------------------------
 
 def _load_devices() -> list[dict]:
@@ -367,6 +442,50 @@ def push_to_devices(task_id: Optional[str]) -> bool:
         except Exception as exc:
             print(f"[voice-bridge] APNs send error: {exc}", flush=True)
             survivors.append(d)  # keep on transient error
+            continue
+        if status == 200:
+            delivered = True
+            survivors.append(d)
+        elif reason in ("BadDeviceToken", "Unregistered") or status == 410:
+            print(f"[voice-bridge] pruning dead device token ({reason})", flush=True)
+        else:
+            print(f"[voice-bridge] APNs {status} {reason}", flush=True)
+            survivors.append(d)
+    if len(survivors) != len(devices):
+        _save_devices(survivors)
+    return delivered
+
+
+def push_approval_to_devices(approval_id: int, description: str) -> bool:
+    """Wake every registered device that an action needs approval (confirm screen
+    09). Like push_to_devices but carries `approval_id` + an APPROVAL category the
+    app routes to the confirm UI; the body is the short action description (no
+    secrets — the full command is fetched via /v1/approvals only after the tap)."""
+    if not APNS_ENABLED:
+        return False
+    devices = _load_devices()
+    if not devices:
+        return False
+    payload = {
+        "aps": {
+            "alert": {"title": "Approve action?",
+                      "body": (description or "An action needs your OK.")[:120]},
+            "sound": "default",
+            "category": "APPROVAL",
+        },
+        "approval_id": approval_id,
+    }
+    delivered, survivors = False, []
+    for d in devices:
+        try:
+            status, reason = _apns.send_push(
+                d["token"], key_path=APNS_KEY_PATH, key_id=APNS_KEY_ID,
+                team_id=APNS_TEAM_ID, topic=APNS_TOPIC,
+                sandbox=(d.get("env") != "production"), payload=payload,
+                push_type="alert")
+        except Exception as exc:
+            print(f"[voice-bridge] APNs approval send error: {exc}", flush=True)
+            survivors.append(d)
             continue
         if status == 200:
             delivered = True
@@ -478,6 +597,9 @@ async def run_claude(prompt: str, cwd: Optional[Path] = None,
     uses into the live per-task activity echo and returning the final spoken reply.
     Bounded by HARD_CAP. `cwd` scopes the run to a project (SPI-255). The prompt is
     fed via stdin (avoids the variadic --allowedTools swallowing it)."""
+    # Confirm gate (opt-in): wire the PreToolUse hook so mutating tools pause for
+    # owner approval. Empty when disabled ⇒ the spawn is byte-identical to before.
+    gate_args = ["--settings", str(CONFIRM_GATE_SETTINGS)] if CONFIRM_GATE_ENABLED else []
     proc = await asyncio.create_subprocess_exec(
         str(CLAUDE_BIN),
         "-p",
@@ -486,6 +608,7 @@ async def run_claude(prompt: str, cwd: Optional[Path] = None,
         "--allowedTools",
         "Read,Glob,Grep,Bash,Write,Edit,Skill,mcp__claude_ai_Linear,mcp__0b5df993-74ea-4b67-ab52-95bf2f19bfdd,ToolSearch",
         "--no-session-persistence",
+        *gate_args,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -723,6 +846,59 @@ async def v1_register_device(reg: DeviceRegistration) -> dict:
         raise HTTPException(status_code=400, detail="Empty token")
     register_device(token, "production" if reg.env == "production" else "sandbox")
     return {"ok": True, "apns_enabled": APNS_ENABLED}
+
+
+# --- Confirm-gate approval endpoints (CONFIRM_GATE.md) ------------------------
+# Active surface only when CONFIRM_GATE_ENABLED wires the PreToolUse hook; the
+# endpoints themselves are always mounted (harmless when nothing posts to them).
+
+class ApprovalCreate(BaseModel):
+    tool: str
+    command: str = ""
+    description: str = ""
+    task_id: Optional[str] = None
+
+
+class ApprovalDecision(BaseModel):
+    decision: str
+
+
+@app.post("/v1/approvals", dependencies=[Depends(_require_key)])
+async def v1_create_approval(req: ApprovalCreate) -> dict:
+    """Create a pending approval (called by the PreToolUse hook) and wake the
+    phone to the confirm screen. Returns the id the hook then polls until decided."""
+    entry = create_approval(req.tool, req.command, req.description, req.task_id)
+    try:
+        push_approval_to_devices(entry["id"], entry["description"])
+    except Exception as exc:
+        print(f"[voice-bridge] approval push failed: {exc}", flush=True)
+    return {"id": entry["id"], "state": entry["state"]}
+
+
+@app.get("/v1/approvals", dependencies=[Depends(_require_key)])
+async def v1_list_approvals() -> dict:
+    """Pending approvals for the app to display (confirm screen 09)."""
+    return {"approvals": pending_approvals()}
+
+
+@app.get("/v1/approvals/{aid}", dependencies=[Depends(_require_key)])
+async def v1_get_approval(aid: int) -> dict:
+    """Poll one approval's state — the hook blocks on this until allow/deny."""
+    a = get_approval(aid)
+    if a is None:
+        raise HTTPException(status_code=404, detail="no such approval")
+    return {"id": a["id"], "state": a["state"]}
+
+
+@app.post("/v1/approvals/{aid}", dependencies=[Depends(_require_key)])
+async def v1_decide_approval(aid: int, req: ApprovalDecision) -> dict:
+    """Record the owner's decision (app confirm screen, Telegram, or terminal)."""
+    if req.decision not in ("allow", "deny"):
+        raise HTTPException(status_code=400, detail="decision must be 'allow' or 'deny'")
+    a = decide_approval(aid, req.decision)
+    if a is None:
+        raise HTTPException(status_code=404, detail="no such approval")
+    return {"ok": True, "id": aid, "state": a["state"]}
 
 
 @app.get("/v1/projects", dependencies=[Depends(_require_key)])

@@ -10,3 +10,5 @@ CLAUDE.local.md
 server.log
 devices.json
 history/
+approvals.json
+confirm_gate_settings.json
