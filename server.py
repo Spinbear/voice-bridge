@@ -592,14 +592,17 @@ def _tool_line(name: str, inp: dict) -> str:
 
 
 async def run_claude(prompt: str, cwd: Optional[Path] = None,
-                     task_id: Optional[str] = None) -> tuple[int, str, str]:
+                     task_id: Optional[str] = None,
+                     confirm: bool = False) -> tuple[int, str, str]:
     """Run the claude CLI with streaming JSON output, capturing each tool the agent
     uses into the live per-task activity echo and returning the final spoken reply.
     Bounded by HARD_CAP. `cwd` scopes the run to a project (SPI-255). The prompt is
     fed via stdin (avoids the variadic --allowedTools swallowing it)."""
-    # Confirm gate (opt-in): wire the PreToolUse hook so mutating tools pause for
-    # owner approval. Empty when disabled ⇒ the spawn is byte-identical to before.
-    gate_args = ["--settings", str(CONFIRM_GATE_SETTINGS)] if CONFIRM_GATE_ENABLED else []
+    # Confirm gate: wire the PreToolUse hook only when the gate is armed server-side
+    # (CONFIRM_GATE_ENABLED) AND this run opted in (the client's `confirm` flag, per
+    # CONFIRM_GATE.md "enable per-connection"). Empty otherwise ⇒ spawn byte-identical.
+    gate_args = (["--settings", str(CONFIRM_GATE_SETTINGS)]
+                 if (CONFIRM_GATE_ENABLED and confirm) else [])
     proc = await asyncio.create_subprocess_exec(
         str(CLAUDE_BIN),
         "-p",
@@ -768,6 +771,7 @@ def strip_force_trigger(text: str) -> tuple[bool, str]:
 class AskRequest(BaseModel):
     text: str
     project: Optional[str] = None   # SPI-255: scope the agent to this folder
+    confirm: bool = False           # client opts this run into the confirm gate (CONFIRM_GATE.md)
 
 
 @app.post("/ask", response_class=PlainTextResponse, dependencies=[Depends(_require_key)])
@@ -785,7 +789,7 @@ async def ask(req: AskRequest):
     history = load_history(project)
     prompt = build_prompt(history, user_text, project)
 
-    task = asyncio.create_task(run_claude(prompt, cwd=project, task_id=task_id))
+    task = asyncio.create_task(run_claude(prompt, cwd=project, task_id=task_id, confirm=req.confirm))
 
     if force_bg:
         # Forced delayed path: detach immediately without waiting the soft
