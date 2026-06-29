@@ -12,6 +12,7 @@ pushed to the phone (Pushcut → a Shortcut speaks it; Telegram as fallback).
 import asyncio
 import json
 import os
+import re
 import urllib.request
 import uuid
 from datetime import datetime
@@ -768,6 +769,29 @@ def strip_force_trigger(text: str) -> tuple[bool, str]:
     return False, text
 
 
+# --- TEMP test affordance (SPI-275): `delay N` -------------------------------
+# A prompt of the form "delay 20" / "delay 40" short-circuits the agent and just
+# waits N seconds before returning a trivial reply, so GoSancho's delayed-task
+# scenarios (sync vs. background promotion, doorbell, notification deep-link) can
+# be exercised on demand without contriving a real long task. REMOVE once that
+# testing is done — must never ship in production. Tracked in SPI-275.
+_DELAY_RE = re.compile(r"^\s*delay\s+(\d{1,3})\s*$", re.IGNORECASE)
+
+
+def parse_delay(text: str) -> Optional[int]:
+    """Return N (clamped to the hard cap) if `text` is exactly `delay N`, else None."""
+    m = _DELAY_RE.match(text or "")
+    if not m:
+        return None
+    return min(int(m.group(1)), HARD_CAP)
+
+
+async def delayed_stub(seconds: int) -> tuple[int, str, str]:
+    """Fake run_claude: sleep, then return a trivial spoken reply (SPI-275)."""
+    await asyncio.sleep(seconds)
+    return 0, f"Delay test complete after {seconds} seconds.", ""
+
+
 class AskRequest(BaseModel):
     text: str
     project: Optional[str] = None   # SPI-255: scope the agent to this folder
@@ -785,11 +809,20 @@ async def ask(req: AskRequest):
     task_id = "t_" + uuid.uuid4().hex[:12]
     headers = {"X-Agent-Task-Id": task_id}
     project = resolve_project(req.project)   # None unless a valid in-bounds folder
-    force_bg, user_text = strip_force_trigger(req.text.strip())
-    history = load_history(project)
-    prompt = build_prompt(history, user_text, project)
 
-    task = asyncio.create_task(run_claude(prompt, cwd=project, task_id=task_id, confirm=req.confirm))
+    # TEMP (SPI-275): `delay N` short-circuits the agent with an N-second stub so
+    # delayed-task scenarios can be tested. Flows through the normal soft-deadline
+    # logic below, so `delay 20` answers synchronously and `delay 40` promotes to
+    # a background job + doorbell, exactly like real short/long tasks. REMOVE later.
+    delay_secs = parse_delay(req.text)
+    if delay_secs is not None:
+        force_bg, user_text = False, req.text.strip()
+        task = asyncio.create_task(delayed_stub(delay_secs))
+    else:
+        force_bg, user_text = strip_force_trigger(req.text.strip())
+        history = load_history(project)
+        prompt = build_prompt(history, user_text, project)
+        task = asyncio.create_task(run_claude(prompt, cwd=project, task_id=task_id, confirm=req.confirm))
 
     if force_bg:
         # Forced delayed path: detach immediately without waiting the soft
