@@ -301,6 +301,13 @@ def enqueue_result(text: str, task_id: Optional[str] = None) -> int:
     entry = {"id": store["seq"], "task_id": task_id, "text": text,
              "created_at": datetime.now().isoformat()}
     store["results"].append(entry)
+    # GoSancho-correlated results (task_id set) are delivered via the non-destructive
+    # /v1/results cursor, NEVER the legacy destructive pop — so mark them as already
+    # handed to the legacy consumer. Otherwise, with no legacy Shortcut popping them,
+    # every such entry stays "legacy-unread" and pins the log past RESULTS_RETAIN,
+    # growing it without bound (SPI-274 always-enqueue makes this the common case).
+    if task_id is not None:
+        store["legacy_cursor"] = max(store["legacy_cursor"], entry["id"])
     if len(store["results"]) > RESULTS_RETAIN:  # bound, but never drop legacy-unread
         unread = {r["id"] for r in store["results"] if r["id"] > store["legacy_cursor"]}
         recent = {r["id"] for r in store["results"][-RESULTS_RETAIN:]}
@@ -796,6 +803,8 @@ class AskRequest(BaseModel):
     text: str
     project: Optional[str] = None   # SPI-255: scope the agent to this folder
     confirm: bool = False           # client opts this run into the confirm gate (CONFIRM_GATE.md)
+    task_id: Optional[str] = None   # SPI-274: client-supplied id so a killed/reconnecting app
+                                    # can recover the result by fetching /v1/results by this id.
 
 
 @app.post("/ask", response_class=PlainTextResponse, dependencies=[Depends(_require_key)])
@@ -803,10 +812,10 @@ async def ask(req: AskRequest):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Empty input")
 
-    # Mint a task id up front and return it as a header. The body stays plain
-    # text (legacy clients ignore the header); new clients use it to correlate
-    # the eventual /v1/results entry to this request.
-    task_id = "t_" + uuid.uuid4().hex[:12]
+    # Task id: prefer the client-supplied one (SPI-274) so a killed/reconnecting app
+    # can recover the result by fetching /v1/results by an id it already persisted;
+    # otherwise mint one. Returned as a header (legacy clients ignore it).
+    task_id = req.task_id or ("t_" + uuid.uuid4().hex[:12])
     headers = {"X-Agent-Task-Id": task_id}
     project = resolve_project(req.project)   # None unless a valid in-bounds folder
 
@@ -841,6 +850,12 @@ async def ask(req: AskRequest):
             raise HTTPException(status_code=502, detail=f"Claude error: {err[:200] or out[:200]}")
         record_turn(user_text, out, project)
         log_activity(user_text, out, "sync")
+        # SPI-274: also enqueue the synchronous result under its task id. The client
+        # normally consumes the inline response, but if it was killed/backgrounded mid-
+        # request (dropping the response), it recovers the answer on relaunch via
+        # /v1/results. No notification fires here — short tasks can't wake a dead app —
+        # but the task no longer hangs at "working".
+        enqueue_result(out, task_id)
         return PlainTextResponse(out, headers=headers)
 
     # Slow path: promote to a background job. Detach it, notify on completion,
